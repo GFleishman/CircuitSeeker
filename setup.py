@@ -6,6 +6,7 @@ setuptools.setup(
     author="Greg M. Fleishman",
     author_email="greg.nli10me@gmail.com",
     description="Tools for finding neural circuits",
+    license="MIT",
     packages=setuptools.find_packages(),
     install_requires=[
         'numpy',
