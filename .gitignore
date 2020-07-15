@@ -1,0 +1,7 @@
+# ignore build files
+build/
+CircuitSeeker.egg-info/
+dist/
+
+# ignore compiled files
+*.pyc
