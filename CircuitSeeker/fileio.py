@@ -2,9 +2,24 @@ import SimpleITK as sitk
 import h5py
 from glob import glob
 from os import path
+import numpy as np
 
 import dask.bag as db
 import dask.array as da
+
+
+def testPathExtensionForHDF5(image_path):
+    """
+    Returns true if `image_path` has an hdf5 like extension
+    Currently: `['.h5', '.hdf5']
+    """
+
+    hdf5_extensions = ['.h5', '.hdf5']
+    if image_path in hdf5_extensions:
+        return True
+    else:
+        ext = path.splitext(image_path)[-1]
+        return ext in hdf5_extensions
 
 
 def globPaths(folder, prefix, suffix):
@@ -27,7 +42,7 @@ def daskBagOfFilePaths(folder, prefix, suffix, npartitions=None):
     """
 
     images = globPaths(folder, prefix, suffix)
-    npartitions = len(images) if npartitions is None
+    if npartitions is None: npartitions = len(images)
     return db.from_sequence(images, npartitions=npartitions)
 
 
@@ -38,7 +53,7 @@ def daskArrayBackedByHDF5(folder, prefix, suffix, dataset_path):
     """
 
     error_message = "daskArrayBackedByHDF5 requires hdf5 files with .h5 or .hdf5 extension"
-    assert (path.splitext(suffix)[-1] in ['.h5', '.hdf5']), error_message
+    assert (testPathExtensionForHDF5(suffix)), error_message
     images = globPaths(folder, prefix, suffix)
     dsets = [readHDF5(image, dataset_path) for image in images]
     arrays = [da.from_array(dset, chunks=(256,)*dset.ndim) for dset in dsets]
@@ -51,11 +66,11 @@ def readHDF5(image_path, dataset_path):
     """
 
     error_message = "readHDF5 requires hdf5 files with .h5 or .hdf5 extension"
-    assert (path.splitext(image_path)[-1] in ['.h5', '.hdf5'], error_message
+    assert (testPathExtensionForHDF5(image_path)), error_message
     return h5py.File(image_path, 'r')[dataset_path]
 
 
-def readImage(image_path, dataset_path=None)
+def readImage(image_path, dataset_path=None):
     """
     Returns array like object for dataset at `image_path`
     If `image_path` is an hdf5 file, you must specify `dataset_path`
@@ -64,9 +79,38 @@ def readImage(image_path, dataset_path=None)
     File format must be either hdf5 or supported by SimpleITK file readers
     """
 
-    if path.splitext(image_path)[-1] in ['.h5', '.hdf5']:
+    if testPathExtensionForHDF5(image_path):
         assert(dataset_path is not None), "Must provide dataset_path for .h5/.hdf5 files"
         return readHDF5(image_path, dataset_path)
     else:
         return sitk.GetArrayFromImage(sitk.ReadImage(image_path))
+
+
+def writeHDF5(image_path, dataset_path, array):
+    """
+    Writes `array` to `image_path[dataset_path]` as an hdf5 file
+    """
+
+    with h5py.File(image_path, 'w') as f:
+        dset = f.create_dataset(dataset_path, array.shape, array.dtype)
+        dset[...] = array
+
+
+def writeImage(image_path, array, spacing=None, axis_order='zyx'):
+    """
+    Writes `array` to `image_path`
+    `image_path` extension determines format - must be supported by SimpleITK image writers
+    Many formats support voxel spacing in the metadata, to specify set `spacing`
+    If format supports voxel spacing in meta data, you can set with `spacing`
+    Use `axis_order` to specify current axis ordering; default: 'zyx'
+    """
+
+    # argsort axis_order
+    transpose_order = [i for (v, i) in sorted((v, i) for (i, v) in enumerate(axis_order))]
+    array = array.transpose(transpose_order[::-1])  # sitk inverts axis order
+    img = sitk.GetImageFromArray(array)
+    if spacing is not None:
+        spacing = spacing[transpose_order]
+        img.SetSpacing(spacing[::-1])
+    sitk.WriteImage(img, image_path)
 
