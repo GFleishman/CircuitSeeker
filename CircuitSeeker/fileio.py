@@ -114,3 +114,14 @@ def writeImage(image_path, array, spacing=None, axis_order='zyx'):
         img.SetSpacing(spacing[::-1])
     sitk.WriteImage(img, image_path)
 
+
+def ensureArray(reference, dataset_path):
+    """
+    """
+
+    if not isinstance(reference, np.ndarray):
+        if not isinstance(reference, str):
+            raise ValueError("image references must be ndarrays or filepaths")
+        reference = readImage(reference, dataset_path)[...]  # hdf5 arrays are lazy
+    return reference
+
