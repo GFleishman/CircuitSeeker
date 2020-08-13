@@ -26,7 +26,7 @@ class distributedState:
 
     def initializeLSFCluster(self,
         walltime="1:00", ncpus=1, cores=1, memory="16GB", threads_per_worker=2,
-        death_timeout="600s", queue="normal", **kwargs
+        death_timeout="600s", queue="normal", processes=1, mem=16000, **kwargs
     ):
         """
         Initialize a dask_jobqueue.LSFCluster
@@ -66,6 +66,8 @@ class distributedState:
             memory=memory,
             env_extra=env_extra,
             death_timeout=death_timeout,
+            processes=processes,
+            mem=mem,
             **kwargs,
         )
         self.setCluster(cluster)
