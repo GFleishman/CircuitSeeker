@@ -1,5 +1,6 @@
 from dask.distributed import Client, LocalCluster
 from dask_jobqueue import LSFCluster
+import dask.config
 from pathlib import Path
 import os
 
@@ -9,6 +10,9 @@ class distributedState:
     def __init__(self):
         self.client = None
         self.cluster = None
+
+    def modifyConfig(self, options):
+        dask.config.set(options)
 
     def setClient(self, client):
         self.client = client
@@ -25,8 +29,10 @@ class distributedState:
 
 
     def initializeLSFCluster(self,
-        walltime="1:00", ncpus=1, cores=1, memory="16GB", threads_per_worker=2,
-        death_timeout="600s", queue="normal", processes=1, mem=16000, **kwargs
+        cores=1, memory="16GB", processes=1,
+        death_timeout="600s", queue="normal", walltime="1:00",
+        ncpus=1, threads_per_worker=2,
+        mem=16000, **kwargs
     ):
         """
         Initialize a dask_jobqueue.LSFCluster
@@ -35,6 +41,8 @@ class distributedState:
         LSFCluster API:
         https://jobqueue.dask.org/en/latest/generated/dask_jobqueue.LSFCluster.html#dask_jobqueue.LSFCluster
         """
+
+        # TODO: add group detection for `project` keyword
 
         if 1 <= threads_per_worker <= 2*cores:
             tpw = threads_per_worker  # shorthand

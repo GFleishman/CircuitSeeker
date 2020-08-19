@@ -168,6 +168,10 @@ def motionCorrect(
     ds = distributed_state
     if distributed_state is None:
         ds = csd.distributedState()
+        # writing large compressed chunks locks GIL for a long time
+        ds.modifyConfig({'distributed.comm.timeouts.connect':'60s',
+                         'distributed.comm.timeouts.tcp':'180s',}
+        )
         ds.initializeLSFCluster(job_extra=["-P scicompsoft"])
         ds.initializeClient()
 
