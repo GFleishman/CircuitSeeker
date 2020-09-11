@@ -159,7 +159,8 @@ def motionCorrect(
     fixed, fixed_vox, moving_vox,
     write_path, dataset_path=None,
     distributed_state=None, sigma=7,
-    transforms_dir=None
+    transforms_dir=None,
+    **kwargs,
 ):
     """
     """
@@ -178,7 +179,13 @@ def motionCorrect(
     # create (lazy) dask bag from all frames
     frames = csio.daskBagOfFilePaths(folder, prefix, suffix)
     nframes = frames.npartitions
-    ds.scaleCluster(njobs=nframes)
+
+    # scale cluster carefully
+    if 'max_workers' in kwargs.keys():
+        max_workers = kwargs['max_workers']
+    else:
+        max_workers = 1250
+    ds.scaleCluster(njobs=min(nframes, max_workers))
 
     # align all
     dfixed = delayed(fixed)
@@ -263,8 +270,7 @@ def distributedImageMean(
         frames = csio.daskBagOfFilePaths(folder, prefix, suffix)
         nframes = frames.npartitions
         ds.scaleCluster(njobs=nframes)
-        frames_mean = frames.map(csio.readImage).reduction(np.sum, np.sum).compute()
-        frames_mean = np.array(frames_mean.compute())
+        frames_mean = frames.map(csio.readImage).reduction(sum, sum).compute()
         dtype = frames_mean.dtype
         frames_mean = np.round(frames_mean/np.float(nframes)).astype(dtype)
 

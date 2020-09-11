@@ -62,11 +62,6 @@ def segmentPretrainedStardist(image, spacing, orientation,
     target_norm = ns['norm_range']
     network = ns['network_path']
 
-    print('target orientation: ', target_orientation)
-    print('target spacing: ', target_spacing)
-    print('target_norm: ', target_norm)
-    print('network location: ', network)
-
     # load image and normalize
     image = csio.ensureArray(image, dataset_path)
     image_res, spacing_res = transpose(

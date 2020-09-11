@@ -9,6 +9,7 @@ import SimpleITK as sitk
 
 # TODO: TEMP
 import sys
+from numpy.random import normal
 
 
 def skipSample(
@@ -34,7 +35,6 @@ def skipSample(
 def numpyToSITK(
     fixed, moving,
     fixed_vox, moving_vox,
-    early_return=False,
     ):
     """
     """
@@ -66,6 +66,26 @@ def matrixToAffineTransform(matrix):
     return transform
 
 
+def matchHistograms(fixed, moving, bins=1024):
+    """
+    """
+
+    matcher = sitk.HistogramMatchingImageFilter()
+    matcher.SetNumberOfHistogramLevels(bins)
+    matcher.SetNumberOfMatchPoints(7)
+    matcher.ThresholdAtMeanIntensityOn()
+    return matcher.Execute(moving, fixed)
+
+
+def speckle(image, scale=0.001):
+    """
+    """
+
+    mn, mx = np.percentile(image, [1, 99])
+    stddev = (mx - mn) * scale
+    return image + normal(scale=stddev, size=image.shape)
+
+
 def getLinearRegistrationModel(
     fixed_vox,
     learning_rate,
@@ -79,8 +99,9 @@ def getLinearRegistrationModel(
     """
 
     # set up registration object
-    irm = sitk.ImageRegistrationMethod()
     ncores = int(os.environ["LSB_DJOB_NUMPROC"])  # LSF specific!
+    sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(2*ncores)
+    irm = sitk.ImageRegistrationMethod()
     irm.SetNumberOfThreads(2*ncores)
     irm.SetInterpolator(sitk.sitkLinear)
 
@@ -92,11 +113,9 @@ def getLinearRegistrationModel(
     irm.SetMetricSamplingPercentage(metric_sampling_percentage)
 
     # optimizer
-    max_step = np.min(fixed_vox)
     irm.SetOptimizerAsGradientDescent(
         numberOfIterations=iterations,
         learningRate=learning_rate,
-        maximumStepSizeInPhysicalUnits=max_step,
     )
     irm.SetOptimizerScalesFromPhysicalShift()
 
@@ -106,9 +125,12 @@ def getLinearRegistrationModel(
     irm.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
 
     # callback
-    irm.AddCommand(
-        sitk.sitkIterationEvent, lambda: print("METRIC: ", irm.GetMetricValue())
-    )
+    def callback(irm):
+        level = irm.GetCurrentLevel()
+        iteration = irm.GetOptimizerIteration()
+        metric = irm.GetMetricValue()
+        print("LEVEL: ", level, " ITERATION: ", iteration, " METRIC: ", metric)
+    irm.AddCommand(sitk.sitkIterationEvent, lambda: callback(irm))
     return irm
 
 
@@ -124,8 +146,9 @@ def getDeformableRegistrationModel(
     """
 
     # set up registration object
-    irm = sitk.ImageRegistrationMethod()
     ncores = int(os.environ["LSB_DJOB_NUMPROC"])  # LSF specific!
+    sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(2*ncores)
+    irm = sitk.ImageRegistrationMethod()
     irm.SetNumberOfThreads(2*ncores)
     irm.SetInterpolator(sitk.sitkLinear)
 
@@ -141,16 +164,27 @@ def getDeformableRegistrationModel(
         maximumStepSizeInPhysicalUnits=max_step,
     )
     irm.SetOptimizerScalesFromPhysicalShift()
-    
+
+#    irm.SetOptimizerAsLBFGS2(
+#        numberOfIterations=iterations,
+#        lineSearchMinimumStep=1e-5,
+#        lineSearchMaximumStep=1e5,
+#        lineSearchMaximumEvaluations=10,
+#    )
+##    irm.SetOptimizerScalesFromPhysicalShift()
+ 
     # pyramid
     irm.SetShrinkFactorsPerLevel(shrinkFactors=shrink_factors)
     irm.SetSmoothingSigmasPerLevel(smoothingSigmas=smooth_sigmas)
     irm.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
 
     # callback
-    irm.AddCommand(
-        sitk.sitkIterationEvent, lambda: print("METRIC: ", irm.GetMetricValue())
-    )
+    def callback(irm):
+        level = irm.GetCurrentLevel()
+        iteration = irm.GetOptimizerIteration()
+        metric = irm.GetMetricValue()
+        print("LEVEL: ", level, " ITERATION: ", iteration, " METRIC: ", metric)
+    irm.AddCommand(sitk.sitkIterationEvent, lambda: callback(irm))
     return irm
 
 
@@ -189,8 +223,9 @@ def rigidAlign(
     irm.SetInitialTransform(sitk.Euler3DTransform())
 
     # execute, return as ndarray
-    transform = irm.Execute(sitk.Cast(fixed, sitk.sitkFloat32),
-                            sitk.Cast(moving, sitk.sitkFloat32),
+    transform = irm.Execute(
+        sitk.Cast(fixed, sitk.sitkFloat32),
+        sitk.Cast(moving, sitk.sitkFloat32),
     )
     etransform = sitk.Euler3DTransform()
     etransform.SetParameters(transform.GetParameters())
@@ -253,21 +288,18 @@ def deformableAlign(
     fixed_vox, moving_vox,
     affine_matrix,
     ncc_radius=8,
-    gradient_smoothing=0.5,
-    field_smoothing=1.5,
-    shrink_factors=[2,1],
-    smooth_sigmas=[1,0],
+    gradient_smoothing=1.0,
+    field_smoothing=0.5,
+    shrink_factors=[2,],
+    smooth_sigmas=[2,],
     learning_rate=1.0,
-    number_of_iterations=5,
+    number_of_iterations=250,
     ):
     """
     """
 
-    fixed_copy = np.copy(fixed)
-    moving_copy = np.copy(moving)
-
     # convert to sitk images, set spacing
-    fixed, moving = numpyToSITK(fixed, moving, fixed_vox, moving_vox, early_return=True)
+    fixed, moving = numpyToSITK(fixed, moving, fixed_vox, moving_vox)
     affine = matrixToAffineTransform(affine_matrix)
 
     # set up registration object
@@ -291,6 +323,17 @@ def deformableAlign(
     )
     irm.SetInitialTransform(dft, inPlace=True)
 
+#    splines = sitk.BSplineTransformInitializer(
+#        image1=fixed,
+#        transformDomainMeshSize=[2, 2, 2],
+#        order=3,
+#    )
+#    irm.SetInitialTransformAsBSpline(
+#        splines,
+#        inPlace=False,
+#        scaleFactors=[1,],
+#    )
+
     # execute
     deformation = irm.Execute(sitk.Cast(fixed, sitk.sitkFloat32),
                               sitk.Cast(moving, sitk.sitkFloat32),
@@ -305,8 +348,8 @@ def distributedDeformableAlign(
     fixed, moving,
     fixed_vox, moving_vox,
     affine_matrix,
-    block_size=[256,256,256],
-    overlap=16, 
+    block_size=[112,112,112],
+    overlap=8, 
     distributed_state=None,
     ):
     """
@@ -326,11 +369,11 @@ def distributedDeformableAlign(
         # TODO: expose cores/tpw, remove job_extra -P
         ds.initializeLSFCluster(
             job_extra=["-P scicompsoft"],
-            ncpus=4,
-            cores=4,
-            threads_per_worker=8,
-            memory="60GB",
-            mem=60000,
+            ncpus=1,
+            cores=1,
+            threads_per_worker=2,
+            memory="15GB",
+            mem=15000,
         )
         ds.initializeClient()
         nchunks = np.ceil(np.array(fixed.shape)/block_size)
@@ -353,26 +396,23 @@ def distributedDeformableAlign(
     moving_da = da.block(moving_blocks)
 
     # deform all chunks
-    # TODO: need to tell map_overlap about new return dimension
+    compute_blocks = [x + 2*overlap for x in block_size] + [3,]
     deformation = da.map_overlap(
         lambda v,w,x,y,z: deformableAlign(v, w, x, y, z),
         fixed_da, moving_da, depth=overlap,
-        dtype=fixed.dtype, chunks=block_size+[3,], new_axis=[3,],
-        x=fixed_vox, y=fixed_vox, z=affine_matrix,
+        dtype=np.float32, chunks=compute_blocks, new_axis=[3,],
+        x=fixed_vox, y=fixed_vox, z=np.eye(4),
     ).compute()
-
-    # TODO: consider smoothing seams (smooth whole image, replace seams)
 
     # release resources
     if distributed_state is None:
         ds.closeClient()
 
     # TODO: TEMP
-#    resampled = applyTransformToImage(
-#        fixed, moving_res, fixed_vox, fixed_vox, displacement=deformation
-#    )
+    resampled = applyTransformToImage(
+        fixed, moving_res, fixed_vox, fixed_vox, displacement=deformation
+    )
 
-    resampled = 1
     return deformation, resampled
 
 
@@ -396,7 +436,7 @@ def applyTransformToImage(
     elif displacement is not None:
         displacement = displacement.astype(np.float64)
         transform = sitk.GetImageFromArray(displacement, isVector=True)
-        transform.SetSpacing(fixed_vox)
+        transform.SetSpacing(fixed_vox[::-1])
         transform = sitk.DisplacementFieldTransform(transform)
 
     # set up resampler object
