@@ -5,11 +5,18 @@ from pathlib import Path
 import os
 
 
-class distributedState:
+class distributedState(object):
+
 
     def __init__(self):
         self.client = None
         self.cluster = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, type, value, traceback):
+        self.closeClient()
 
     def modifyConfig(self, options):
         dask.config.set(options)

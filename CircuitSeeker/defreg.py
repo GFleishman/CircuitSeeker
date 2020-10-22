@@ -5,6 +5,8 @@ import CircuitSeeker.fileio as csio
 import CircuitSeeker.distributed as csd
 import dask.array as da
 
+import greedypy.greedypy_registration_method as grm
+
 import SimpleITK as sitk
 
 # TODO: TEMP
@@ -35,6 +37,7 @@ def skipSample(
 def numpyToSITK(
     fixed, moving,
     fixed_vox, moving_vox,
+    fixed_orig=None, moving_orig=None,
     ):
     """
     """
@@ -43,6 +46,12 @@ def numpyToSITK(
     moving = sitk.GetImageFromArray(moving.copy().astype(np.float32))
     fixed.SetSpacing(fixed_vox[::-1])
     moving.SetSpacing(moving_vox[::-1])
+
+    if fixed_orig is None: fixed_orig = np.zeros(len(fixed_vox))
+    if moving_orig is None: moving_orig = np.zeros(len(moving_vox))
+    fixed.SetOrigin(fixed_orig[::-1])
+    moving.SetOrigin(moving_orig[::-1])
+
     return fixed, moving
 
 
@@ -64,6 +73,16 @@ def matrixToAffineTransform(matrix):
     transform.SetMatrix(matrix[:3, :3].flatten())
     transform.SetTranslation(matrix[:3, -1].squeeze())
     return transform
+
+
+def fieldToDisplacementFieldTransform(field, spacing):
+    """
+    """
+
+    field = field.astype(np.float64)
+    transform = sitk.GetImageFromArray(field, isVector=True)
+    transform.SetSpacing(spacing[::-1])
+    return sitk.DisplacementFieldTransform(transform)
 
 
 def matchHistograms(fixed, moving, bins=1024):
@@ -134,60 +153,6 @@ def getLinearRegistrationModel(
     return irm
 
 
-def getDeformableRegistrationModel(
-    fixed_vox,
-    learning_rate,
-    iterations,
-    shrink_factors,
-    smooth_sigmas,
-    ncc_radius,
-    ):
-    """
-    """
-
-    # set up registration object
-    ncores = int(os.environ["LSB_DJOB_NUMPROC"])  # LSF specific!
-    sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(2*ncores)
-    irm = sitk.ImageRegistrationMethod()
-    irm.SetNumberOfThreads(2*ncores)
-    irm.SetInterpolator(sitk.sitkLinear)
-
-    # metric
-    irm.SetMetricAsANTSNeighborhoodCorrelation(ncc_radius)
-    irm.MetricUseFixedImageGradientFilterOff()
-
-    # optimizer
-    max_step = np.min(fixed_vox)
-    irm.SetOptimizerAsGradientDescent(
-        numberOfIterations=iterations,
-        learningRate=learning_rate,
-        maximumStepSizeInPhysicalUnits=max_step,
-    )
-    irm.SetOptimizerScalesFromPhysicalShift()
-
-#    irm.SetOptimizerAsLBFGS2(
-#        numberOfIterations=iterations,
-#        lineSearchMinimumStep=1e-5,
-#        lineSearchMaximumStep=1e5,
-#        lineSearchMaximumEvaluations=10,
-#    )
-##    irm.SetOptimizerScalesFromPhysicalShift()
- 
-    # pyramid
-    irm.SetShrinkFactorsPerLevel(shrinkFactors=shrink_factors)
-    irm.SetSmoothingSigmasPerLevel(smoothingSigmas=smooth_sigmas)
-    irm.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
-
-    # callback
-    def callback(irm):
-        level = irm.GetCurrentLevel()
-        iteration = irm.GetOptimizerIteration()
-        metric = irm.GetMetricValue()
-        print("LEVEL: ", level, " ITERATION: ", iteration, " METRIC: ", metric)
-    irm.AddCommand(sitk.sitkIterationEvent, lambda: callback(irm))
-    return irm
-
-
 def rigidAlign(
     fixed, moving,
     fixed_vox, moving_vox,
@@ -232,12 +197,13 @@ def rigidAlign(
     return affineTransformToMatrix(etransform)
 
 
+# TODO: default sampling percentage should be 0.25 - changed for piecewise testing
 def affineAlign(
     fixed, moving,
     fixed_vox, moving_vox,
     rigid_matrix=None,
     number_of_histogram_bins=128,
-    metric_sampling_percentage=0.25,
+    metric_sampling_percentage=1.0,
     shrink_factors=[2,1],
     smooth_sigmas=[1,0],
     learning_rate=1.0,
@@ -286,86 +252,45 @@ def affineAlign(
 def deformableAlign(
     fixed, moving,
     fixed_vox, moving_vox,
-    affine_matrix,
-    ncc_radius=8,
-    gradient_smoothing=1.0,
-    field_smoothing=0.5,
-    shrink_factors=[2,],
-    smooth_sigmas=[2,],
-    learning_rate=1.0,
-    number_of_iterations=250,
+    radius=32,
+    gradient_smoothing=[3.0, 0.0, 1.0, 2.0],
+    field_smoothing=[0.5, 0.0, 1.0, 6.0],
+    iterations=[200,100],
+    shrink_factors=[2,1],
+    smooth_sigmas=[1,0],
+    step=5.0,
     ):
     """
     """
 
-    # convert to sitk images, set spacing
-    fixed, moving = numpyToSITK(fixed, moving, fixed_vox, moving_vox)
-    affine = matrixToAffineTransform(affine_matrix)
-
-    # set up registration object
-    irm = getDeformableRegistrationModel(
-        fixed_vox,
-        learning_rate,
-        number_of_iterations,
+    register = grm.greedypy_registration_method(
+        fixed, fixed_vox,
+        moving, moving_vox,
+        iterations,
         shrink_factors,
         smooth_sigmas,
-        ncc_radius,
+        radius=radius,
+        gradient_abcd=gradient_smoothing,
+        field_abcd=field_smoothing,
     )
 
-    # initialize
-    tdff = sitk.TransformToDisplacementFieldFilter()
-    tdff.SetReferenceImage(fixed)
-    df = tdff.Execute(affine)
-    dft = sitk.DisplacementFieldTransform(df)
-    dft.SetSmoothingGaussianOnUpdate(
-        varianceForUpdateField=gradient_smoothing,
-        varianceForTotalField=field_smoothing,
-    )
-    irm.SetInitialTransform(dft, inPlace=True)
-
-#    splines = sitk.BSplineTransformInitializer(
-#        image1=fixed,
-#        transformDomainMeshSize=[2, 2, 2],
-#        order=3,
-#    )
-#    irm.SetInitialTransformAsBSpline(
-#        splines,
-#        inPlace=False,
-#        scaleFactors=[1,],
-#    )
-
-    # execute
-    deformation = irm.Execute(sitk.Cast(fixed, sitk.sitkFloat32),
-                              sitk.Cast(moving, sitk.sitkFloat32),
-   )
-
-    # convert to displacement vector field and return as ndarray
-    tdff.SetOutputPixelType(sitk.sitkVectorFloat32)
-    return sitk.GetArrayFromImage(tdff.Execute(deformation))
+    register.mask_values(0)
+    register.optimize()
+    return register.get_warp()
 
 
-def distributedDeformableAlign(
+def distributedPiecewiseAffineAlign(
     fixed, moving,
     fixed_vox, moving_vox,
-    affine_matrix,
-    block_size=[112,112,112],
-    overlap=8, 
-    distributed_state=None,
+    block_size=[128,128,128],
+    overlap=64,
     ):
     """
     """
 
-    # reasmple moving image with affine
-    moving_res = applyTransformToImage(
-        fixed, moving,
-        fixed_vox, moving_vox,
-        matrix=affine_matrix
-    )
+    # set up cluster
+    with csd.distributedState() as ds:
 
-    # set up the distributed environment
-    ds = distributed_state
-    if distributed_state is None:
-        ds = csd.distributedState()
         # TODO: expose cores/tpw, remove job_extra -P
         ds.initializeLSFCluster(
             job_extra=["-P scicompsoft"],
@@ -380,37 +305,107 @@ def distributedDeformableAlign(
         ds.scaleCluster(njobs=np.prod(nchunks))
 
     # TODO: refactor into a function, generalize w.r.t. dimension, share on github
+    # TODO: pad array so large overlaps will work (chunk can't be smaller than overlap)
     # chunk ndarrays onto workers and stack as single dask array
-    bs = block_size  # shorthand
-    fixed_blocks = [[
-        [da.from_array(fixed[i:i+bs[0], j:j+bs[1], k:k+bs[2]])
-        for k in range(0, fixed.shape[2], bs[2])]
-        for j in range(0, fixed.shape[1], bs[1])]
-        for i in range(0, fixed.shape[0], bs[0])]
-    fixed_da = da.block(fixed_blocks)
-    moving_blocks = [[
-        [da.from_array(moving_res[i:i+bs[0], j:j+bs[1], k:k+bs[2]])
-        for k in range(0, moving_res.shape[2], bs[2])]
-        for j in range(0, moving_res.shape[1], bs[1])]
-        for i in range(0, moving_res.shape[0], bs[0])]
-    moving_da = da.block(moving_blocks)
+        bs = block_size  # shorthand
+        fixed_blocks = [[
+            [da.from_array(fixed[i:i+bs[0], j:j+bs[1], k:k+bs[2]])
+            for k in range(0, fixed.shape[2], bs[2])]
+            for j in range(0, fixed.shape[1], bs[1])]
+            for i in range(0, fixed.shape[0], bs[0])]
+        fixed_da = da.block(fixed_blocks)
+        moving_blocks = [[
+            [da.from_array(moving[i:i+bs[0], j:j+bs[1], k:k+bs[2]])
+            for k in range(0, moving.shape[2], bs[2])]
+            for j in range(0, moving.shape[1], bs[1])]
+            for i in range(0, moving.shape[0], bs[0])]
+        moving_da = da.block(moving_blocks)
 
-    # deform all chunks
-    compute_blocks = [x + 2*overlap for x in block_size] + [3,]
-    deformation = da.map_overlap(
-        lambda v,w,x,y,z: deformableAlign(v, w, x, y, z),
-        fixed_da, moving_da, depth=overlap,
-        dtype=np.float32, chunks=compute_blocks, new_axis=[3,],
-        x=fixed_vox, y=fixed_vox, z=np.eye(4),
-    ).compute()
+        # affine align all chunks
+        # TODO: need way to get registration parameters as input to this function
+        piecewise_affine_aligned = da.map_overlap(
+            lambda w,x,y,z: affineAlign(w, x, y, z, target_spacing=None, rigid_matrix=np.eye(4)),
+            fixed_da, moving_da,
+            depth=overlap,
+            dtype=np.float32,
+            boundary='reflect',
+            y=fixed_vox, z=fixed_vox,
+        ).compute()
 
-    # release resources
-    if distributed_state is None:
-        ds.closeClient()
+        return piecewise_affine_aligned
+
+    
+
+def distributedDeformableAlign(
+    fixed, moving,
+    fixed_vox, moving_vox,
+    affine_matrix,
+    block_size=[96,96,96],
+    overlap=16, 
+    distributed_state=None,
+    ):
+    """
+    """
+
+    # reasmple moving image with affine
+    moving_res = applyTransformToImage(
+        fixed, moving,
+        fixed_vox, moving_vox,
+        matrix=affine_matrix
+    )
+
+    # set up cluster
+    # TODO: need way to pass distributed_state as context manager?
+    with csd.distributedState() as ds:
+
+        # TODO: expose cores/tpw, remove job_extra -P
+        ds.initializeLSFCluster(
+            job_extra=["-P scicompsoft"],
+            ncpus=1,
+            cores=1,
+            threads_per_worker=2,
+            memory="15GB",
+            mem=15000,
+        )
+        ds.initializeClient()
+        nchunks = np.ceil(np.array(fixed.shape)/block_size)
+        ds.scaleCluster(njobs=np.prod(nchunks))
+
+    # TODO: refactor into a function, generalize w.r.t. dimension, share on github
+    # TODO: pad array so large overlaps will work (chunk can't be smaller than overlap)
+    # chunk ndarrays onto workers and stack as single dask array
+        bs = block_size  # shorthand
+        fixed_blocks = [[
+            [da.from_array(fixed[i:i+bs[0], j:j+bs[1], k:k+bs[2]])
+            for k in range(0, fixed.shape[2], bs[2])]
+            for j in range(0, fixed.shape[1], bs[1])]
+            for i in range(0, fixed.shape[0], bs[0])]
+        fixed_da = da.block(fixed_blocks)
+        moving_blocks = [[
+            [da.from_array(moving_res[i:i+bs[0], j:j+bs[1], k:k+bs[2]])
+            for k in range(0, moving_res.shape[2], bs[2])]
+            for j in range(0, moving_res.shape[1], bs[1])]
+            for i in range(0, moving_res.shape[0], bs[0])]
+        moving_da = da.block(moving_blocks)
+    
+        # deform all chunks
+        # TODO: need way to get registration parameters as input to this function
+        compute_blocks = [x + 2*overlap for x in block_size] + [3,]
+        deformation = da.map_overlap(
+            lambda w,x,y,z: deformableAlign(w, x, y, z),
+            fixed_da, moving_da,
+            depth=overlap,
+            dtype=np.float32,
+            chunks=compute_blocks,
+            new_axis=[3,],
+            align_arrays=False,
+            boundary='reflect',
+            y=fixed_vox, z=fixed_vox,
+        ).compute()
 
     # TODO: TEMP
     resampled = applyTransformToImage(
-        fixed, moving_res, fixed_vox, fixed_vox, displacement=deformation
+       fixed, moving_res, fixed_vox, fixed_vox, displacement=deformation
     )
 
     return deformation, resampled
@@ -419,25 +414,33 @@ def distributedDeformableAlign(
 def applyTransformToImage(
     fixed, moving,
     fixed_vox, moving_vox,
-    matrix=None, displacement=None,
+    transform_list,
+    transform_spacing=None,
+    fixed_orig=None, moving_orig=None,
     ):
     """
     """
 
-    # need matrix or displacement
-    error = "affine matrix or diplacement field required, but not both"
-    assert( (matrix is not None) != (displacement is not None) ), error
-
-    # convert to sitk objects
+    # convert images to sitk objects
     dtype = fixed.dtype
-    fixed, moving = numpyToSITK(fixed, moving, fixed_vox, moving_vox)
-    if matrix is not None:
-        transform = matrixToAffineTransform(matrix)
-    elif displacement is not None:
-        displacement = displacement.astype(np.float64)
-        transform = sitk.GetImageFromArray(displacement, isVector=True)
-        transform.SetSpacing(fixed_vox[::-1])
-        transform = sitk.DisplacementFieldTransform(transform)
+    fixed, moving = numpyToSITK(
+        fixed, moving,
+        fixed_vox, moving_vox,
+        fixed_orig, moving_orig,
+    )
+
+    # default transform spacing is fixed voxel spacing 
+    if transform_spacing is None:
+        transform_spacing = fixed_vox
+
+    # construct transform
+    transform = sitk.Transform()
+    for t in transform_list:
+        if len(t.shape) == 2:
+            t = matrixToAffineTransform(t)
+        elif len(t.shape) == 4:
+            t = fieldToDisplacementFieldTransform(t, transform_spacing)
+        transform.AddTransform(t)
 
     # set up resampler object
     resampler = sitk.ResampleImageFilter()
