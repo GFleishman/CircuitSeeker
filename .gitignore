@@ -5,3 +5,7 @@ dist/
 
 # ignore compiled files
 *.pyc
+
+# ignore swap files
+*~
+
