@@ -14,10 +14,16 @@ setuptools.setup(
         'numpy',
         'scipy',
         'h5py',
-        'dask[complete]',
+        'dask',
+        'dask[array]',
+        'dask[bag]',
+        'dask[dataframe]',
+        'dask[delayed]',
+        'dask[distributed]',
         'dask-jobqueue',
         'SimpleITK',
         'zarr',
         'numcodecs',
+        'morphsnakes',
     ]
 )

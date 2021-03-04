@@ -36,20 +36,13 @@ class distributedState(object):
 
 
     def initializeLSFCluster(self,
-        cores=1, memory="16GB", processes=1,
-        death_timeout="600s", queue="normal", walltime="1:00",
+        cores=1, memory="15GB", processes=1,
+        death_timeout="600s", walltime="1:00",
         ncpus=1, threads_per_worker=2,
-        mem=16000, **kwargs
+        mem=15000, project="", **kwargs
     ):
         """
-        Initialize a dask_jobqueue.LSFCluster
-        inspired by:
-        https://github.com/janelia-cosem/fst/blob/master/fst/distributed.py
-        LSFCluster API:
-        https://jobqueue.dask.org/en/latest/generated/dask_jobqueue.LSFCluster.html#dask_jobqueue.LSFCluster
         """
-
-        # TODO: add group detection for `project` keyword
 
         if 1 <= threads_per_worker <= 2*cores:
             tpw = threads_per_worker  # shorthand
@@ -74,15 +67,15 @@ class distributedState(object):
             kwargs["log_directory"] = log_dir
 
         cluster = LSFCluster(
-            queue=queue,
-            walltime=walltime,
             cores=cores,
-            ncpus=ncpus,
             memory=memory,
-            env_extra=env_extra,
-            death_timeout=death_timeout,
             processes=processes,
+            death_timeout=death_timeout,
+            walltime=walltime,
+            ncpus=ncpus,
             mem=mem,
+            project=project,
+            env_extra=env_extra,
             **kwargs,
         )
         self.setCluster(cluster)

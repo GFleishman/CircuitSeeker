@@ -99,6 +99,8 @@ def compute_arc_lengths(mask, smp, spacing, cor_axis, ax_axis, sag_plane):
     arc = 0
     result = []
     previous_slice = None
+    ant_mark = 0
+    post_mark = mask.shape[cor_axis] - 1
     for i in range(mask.shape[cor_axis]):
         # compute coordinates
         x = i * spacing[cor_axis]

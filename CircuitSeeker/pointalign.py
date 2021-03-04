@@ -1,5 +1,5 @@
 import numpy as np
-from scipy.ndimage.morphology import binary_erosion
+from scipy.ndimage.morphology import binary_opening
 from scipy.ndimage.measurements import label, center_of_mass
 from scipy.spatial import cKDTree
 from scipy.ndimage import gaussian_filter, gaussian_filter1d
@@ -27,12 +27,12 @@ def cells_point_cloud(
 
     dog = difference_of_gaussians_3d(image, big_sigma/spacing, small_sigma/spacing)
     dog = (dog >= threshold).astype(np.uint16)
-    points = binary_erosion(dog, structure=erode_filter).astype(np.uint16)
+    dog = binary_opening(dog, structure=erode_filter).astype(np.uint16)
     if mask is not None:
-        points = points * mask
-    point_labels, npoints = label(points)
-    points = center_of_mass(points, labels=point_labels, index=range(1, npoints))
-    return np.array(points) * spacing, dog
+        dog = dog * mask
+    point_labels, npoints = label(dog)
+    points = center_of_mass(dog, labels=point_labels, index=range(1, npoints))
+    return np.array(points) * spacing, point_labels
 
 
 def get_context(image, position, radius):
