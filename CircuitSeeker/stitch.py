@@ -3,17 +3,36 @@ import dask.array as da
 import copy
 from itertools import product
 
-
-def weight_block(block, blocksize):
+def weight_block(block, blocksize, block_info=None):
     """
     """
 
+    # compute fixed overlap size
     overlaps = blocksize // 2
-    weights = da.ones(blocksize % 2 + 2, dtype=np.float32)
-    pads = [(2*p-1, 2*p-1) for p in overlaps]
+
+    # determine which faces need linear weighting
+    core_shape = []
+    pads = []
+    block_index = block_info[0]['chunk-location']
+    block_grid = block_info[0]['num-chunks']
+    for i in range(3):
+        p, bl = overlaps[i], blocksize[i]
+        bi, bg = block_index[i], block_grid[i]
+        pad, core = [2*p+1, 2*p+1], bl - 2*p
+        if bi == 0:
+            pad[0], core = 0, core + 2*p+1
+        if bi == bg-1:
+            pad[1], core = 0, core + 2*p+1
+        pads.append(tuple(pad))
+        core_shape.append(core)
+
+    # create weights
+    weights = da.ones(core_shape, dtype=np.float32)
     weights = da.pad(weights, pads, mode='linear_ramp', end_values=0)
+    weights = weights[1:-1, 1:-1, 1:-1]
     weights = weights.reshape(weights.shape + (1,))
-    result = da.multiply(block, weights)
+
+    # multiply data by weights and return
     return da.multiply(block, weights)
 
 
