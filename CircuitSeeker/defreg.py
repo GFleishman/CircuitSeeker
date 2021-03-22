@@ -7,7 +7,8 @@ import CircuitSeeker.stitch as stitch
 import dask.array as da
 import greedypy.greedypy_registration_method as grm
 import SimpleITK as sitk
-from scipy.ndimage import find_objects, zoom, minimum_filter
+from scipy.ndimage import find_objects, zoom
+from scipy.ndimage import minimum_filter, gaussian_filter
 
 
 def skipSample(image, spacing, target_spacing):
@@ -173,6 +174,8 @@ def rigidAlign(
     target_spacing=2.0,
     fixed_mask=None,
     moving_mask=None,
+    fixed_origin=None,
+    moving_origin=None,
     foreground_percentage_threshold=0.2,
 ):
     """
@@ -200,8 +203,8 @@ def rigidAlign(
         moving_vox = moving_vox_ss
 
     # convert to sitk images, set spacing
-    fixed = numpyToSITK(fixed, fixed_vox)
-    moving = numpyToSITK(moving, moving_vox)
+    fixed = numpyToSITK(fixed, fixed_vox, origin=fixed_origin)
+    moving = numpyToSITK(moving, moving_vox, origin=moving_origin)
 
     # set up registration object, initialize
     irm = getLinearRegistrationModel(
@@ -218,10 +221,10 @@ def rigidAlign(
 
     # set masks
     if fixed_mask is not None:
-        fixed_mask = numpyToSITK(fixed_mask, fixed_vox)
+        fixed_mask = numpyToSITK(fixed_mask, fixed_vox, origin=fixed_origin)
         irm.SetMetricFixedMask(fixed_mask)
     if moving_mask is not None:
-        moving_mask = numpyToSITK(moving_mask, moving_vox)
+        moving_mask = numpyToSITK(moving_mask, moving_vox, origin=moving_origin)
         irm.SetMetricMovingMask(moving_mask)
 
     # execute, return as ndarray
@@ -260,6 +263,8 @@ def affineAlign(
     target_spacing=2.0,
     fixed_mask=None,
     moving_mask=None,
+    fixed_origin=None,
+    moving_origin=None,
     foreground_percentage_threshold=0.2,
 ):
     """
@@ -287,8 +292,8 @@ def affineAlign(
         moving_vox = moving_vox_ss
 
     # convert to sitk images, set spacing
-    fixed = numpyToSITK(fixed, fixed_vox)
-    moving = numpyToSITK(moving, moving_vox)
+    fixed = numpyToSITK(fixed, fixed_vox, origin=fixed_origin)
+    moving = numpyToSITK(moving, moving_vox, origin=moving_origin)
     rigid = matrixToAffineTransform(rigid_matrix)
 
     # set up registration object
@@ -312,10 +317,10 @@ def affineAlign(
 
     # set masks
     if fixed_mask is not None:
-        fixed_mask = numpyToSITK(fixed_mask, fixed_vox)
+        fixed_mask = numpyToSITK(fixed_mask, fixed_vox, origin=fixed_origin)
         irm.SetMetricFixedMask(fixed_mask)
     if moving_mask is not None:
-        moving_mask = numpyToSITK(moving_mask, moving_vox)
+        moving_mask = numpyToSITK(moving_mask, moving_vox, origin=moving_origin)
         irm.SetMetricMovingMask(moving_mask)
 
     # execute, return as ndarray
@@ -345,7 +350,8 @@ def exhaustiveTranslation(
     num_steps, step_sizes,
     fixed_origin=None,
     moving_origin=None,
-    block_info=None,
+    peak_ratio=1.2,
+    bins=128,
 ):
     """
     """
@@ -369,7 +375,7 @@ def exhaustiveTranslation(
 
     # set metric
     irm.SetMetricAsMattesMutualInformation(
-        numberOfHistogramBins=128,
+        numberOfHistogramBins=bins,
     )
 
     # set exhaustive optimizer
@@ -381,7 +387,7 @@ def exhaustiveTranslation(
     irm.SetInitialTransform(tx)
 
     # keep track of alignment scores
-    scores = np.empty(tuple(2*x+1 for x in num_steps[::-1]), dtype=np.float32)
+    scores = np.zeros(tuple(2*x+1 for x in num_steps[::-1]), dtype=np.float32)
     def callback(irm):
         iteration = irm.GetOptimizerIteration()
         indx = np.unravel_index(iteration, scores.shape, order='F')
@@ -405,7 +411,7 @@ def exhaustiveTranslation(
 
     # determine if minimum is good enough
     trans = np.zeros(3)
-    if min1 <= min2*1.2:
+    if min1 <= min2*peak_ratio:
         trans = (np.array(min1_indx) - num_steps[::-1]) * step_sizes[::-1]
 
     # return translation in xyz order
@@ -500,9 +506,9 @@ def distributedPiecewiseAffine(
     with csd.distributedState() as ds:
 
         # TODO: expose cores/tpw, remove job_extra -P
-        ds.initializeLSFCluster(job_extra=["-P scicompsoft"],
-        cores=2, memory="30GB", ncpus=2, mem=30000, threads_per_worker=4,
-        walltime="48:00",
+        ds.initializeLSFCluster(
+        cores=2, memory="30GB", ncpus=2, mem=30000000, threads_per_worker=4,
+        walltime="3:59", project="ahrens",
         )
         ds.initializeClient()
         ds.scaleCluster(njobs=np.prod(nblocks)+1)
@@ -619,6 +625,7 @@ def distributedNestedExhaustiveRigid(
     step_sizes,
     smooth_sigma,
     nworkers=100,
+    **kwargs,
     ):
     """
     """
@@ -671,12 +678,12 @@ def distributedNestedExhaustiveRigid(
         num_steps = [int(x) for x in num_steps]
 
         # closure for exhaustive translation alignment
-        def my_exhaustive_translation(x, y, block_info=None):
+        def my_exhaustive_translation(x, y):
             t = exhaustiveTranslation(
                 x, y, fixed_vox, moving_vox,
                 num_steps, step_sizes,
                 moving_origin=moving_origin,
-                block_info=block_info,
+                **kwargs,
             )
             return np.array(t).reshape((1, 3))
 
