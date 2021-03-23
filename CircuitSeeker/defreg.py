@@ -1,81 +1,68 @@
 import numpy as np
-import os
-from numpy.random import normal
-import CircuitSeeker.fileio as csio
-import CircuitSeeker.distributed as csd
+import os, sys
 import CircuitSeeker.stitch as stitch
 import dask.array as da
 import greedypy.greedypy_registration_method as grm
 import SimpleITK as sitk
 from scipy.ndimage import find_objects, zoom
 from scipy.ndimage import minimum_filter, gaussian_filter
+import ClusterWrap
 
 
-def skipSample(image, spacing, target_spacing):
+def skip_sample(image, spacing, ss_spacing):
     """
     """
 
-    ss = np.maximum(np.round(target_spacing / spacing), 1).astype(np.int)
+    ss = np.maximum(np.round(ss_spacing / spacing), 1).astype(np.int)
     image = image[::ss[0], ::ss[1], ::ss[2]]
     spacing = spacing * ss
     return image, spacing
 
 
-def numpyToSITK(image, spacing, origin=None, isVector=False):
+def numpy_to_sitk(image, spacing, origin=None, vector=False):
     """
     """
 
-    image = sitk.GetImageFromArray(
-        image.copy().astype(np.float32),
-        isVector=isVector,
-    )
+    image = sitk.GetImageFromArray(image.copy(), isVector=vector)
     image.SetSpacing(spacing[::-1])
-    if origin is None: origin = np.zeros(len(spacing))
+    if origin is None:
+        origin = np.zeros(len(spacing))
     image.SetOrigin(origin[::-1])
     return image
 
 
-def affineTransformToMatrix(transform):
+def invert_matrix_axes(matrix):
     """
     """
 
-    matrix = np.eye(4)
-    matrix[:3, :3] = np.array(transform.GetMatrix()).reshape((3,3))
-    matrix[:3, -1] = np.array(transform.GetTranslation())
-    return matrix
-
-
-def matrixToAffineTransform(matrix):
-    """
-    """
-
-    transform = sitk.AffineTransform(3)
-    transform.SetMatrix(matrix[:3, :3].flatten())
-    transform.SetTranslation(matrix[:3, -1].squeeze())
-    return transform
-
-
-def sitkAxesToConventionalAxes(matrix):
-    """
-    """
-    
     corrected = np.eye(4)
     corrected[:3, :3] = matrix[:3, :3][::-1, ::-1]
     corrected[:3, -1] = matrix[:3, -1][::-1]
     return corrected
 
 
-def fieldToDisplacementFieldTransform(field, spacing):
+def affine_transform_to_matrix(transform):
     """
     """
 
-    field = field.astype(np.float64)
-    transform = sitk.GetImageFromArray(field, isVector=True)
-    transform.SetSpacing(spacing[::-1])
-    return sitk.DisplacementFieldTransform(transform)
+    matrix = np.eye(4)
+    matrix[:3, :3] = np.array(transform.GetMatrix()).reshape((3,3))
+    matrix[:3, -1] = np.array(transform.GetTranslation())
+    return invert_matrix_axes(matrix)
 
 
-def matrixToDisplacementField(reference, matrix, spacing):
+def matrix_to_affine_transform(matrix):
+    """
+    """
+
+    matrix_sitk = invert_matrix_axes(matrix)
+    transform = sitk.AffineTransform(3)
+    transform.SetMatrix(matrix_sitk[:3, :3].flatten())
+    transform.SetTranslation(matrix_sitk[:3, -1].squeeze())
+    return transform
+
+
+def matrix_to_displacement_field(reference, matrix, spacing):
     """
     """
 
@@ -86,36 +73,25 @@ def matrixToDisplacementField(reference, matrix, spacing):
     return np.einsum('...ij,...j->...i', mm, grid) + tt - grid
 
 
-def matchHistograms(fixed, moving, bins=1024):
+def field_to_displacement_field_transform(field, spacing):
     """
     """
 
-    matcher = sitk.HistogramMatchingImageFilter()
-    matcher.SetNumberOfHistogramLevels(bins)
-    matcher.SetNumberOfMatchPoints(7)
-    matcher.ThresholdAtMeanIntensityOn()
-    return matcher.Execute(moving, fixed)
+    field = field.astype(np.float64)
+    transform = numpy_to_sitk(field, spacing, vector=True)
+    return sitk.DisplacementFieldTransform(transform)
 
 
-def speckle(image, scale=0.001):
-    """
-    """
-
-    mn, mx = np.percentile(image, [1, 99])
-    stddev = (mx - mn) * scale
-    return image + normal(scale=stddev, size=image.shape)
-
-
-def getLinearRegistrationModel(
-    fixed_vox,
-    learning_rate,
-    iterations,
-    metric_sampling_percentage,
-    shrink_factors,
-    smooth_sigmas,
-    metric='MI',
-    number_of_histogram_bins=128,
-    lcc_radius=8,
+def configure_irm(
+    metric='MI', bins=128,
+    sampling='regular', sampling_percentage=1.0,
+    optimizer='GD', iterations=200, learning_rate=1.0,
+    min_step=1.0, max_step=1.0,
+    shrink_factors=[2,1],
+    smooth_sigmas=[2,1],
+    num_steps=[2, 2, 2],
+    step_sizes=[1., 1., 1.],
+    callback=None,
 ):
     """
     """
@@ -125,268 +101,306 @@ def getLinearRegistrationModel(
     sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(2*ncores)
     irm = sitk.ImageRegistrationMethod()
     irm.SetNumberOfThreads(2*ncores)
+
+    # set interpolator
     irm.SetInterpolator(sitk.sitkLinear)
 
-    # metric
+    # set metric
     if metric == 'MI':
         irm.SetMetricAsMattesMutualInformation(
-            numberOfHistogramBins=number_of_histogram_bins,
+            numberOfHistogramBins=bins,
         )
     elif metric == 'CC':
         irm.SetMetricAsCorrelation()
-    elif metric == 'LCC':
-        irm.SetMetricAsANTSNeighborhoodCorrelation(lcc_radius)
-    irm.SetMetricSamplingStrategy(irm.RANDOM)
-    irm.SetMetricSamplingPercentage(metric_sampling_percentage)
+    elif metric == 'MS':
+        irm.SetMetricAsMeanSquares()
 
-    # optimizer
-    irm.SetOptimizerAsGradientDescent(
-        numberOfIterations=iterations,
-        learningRate=learning_rate,
-    )
-    irm.SetOptimizerScalesFromPhysicalShift()
+    # set metric sampling
+    if sampling == 'regular':
+        irm.SetMetricSamplingStrategy(irm.REGULAR)
+    elif sampling == 'random':
+        irm.SetMetricSamplingStrategy(irm.RANDOM)
+    irm.SetMetricSamplingPercentage(sampling_percentage)
 
-    # pyramid
+    # set optimizer
+    if optimizer == 'GD':
+        irm.SetOptimizerAsGradientDescent(
+            numberOfIterations=iterations,
+            learningRate=learning_rate,
+        )
+        irm.SetOptimizerScalesFromPhysicalShift()
+    elif optimizer == 'RGD':
+        irm.SetOptimizerAsRegularStepGradientDescent(
+            minStep=min_step, learningRate=learning_rate,
+            numberOfIterations=iterations,
+            maximumStepSizeInPhysicalUnits=max_step,
+        )
+        irm.SetOptimizerScalesFromPhysicalShift()
+    elif optimizer == 'EX':
+        irm.SetOptimizerAsExhaustive(num_steps[::-1])
+        irm.SetOptimizerScales(step_sizes[::-1])
+
+    # set pyramid
     irm.SetShrinkFactorsPerLevel(shrinkFactors=shrink_factors)
     irm.SetSmoothingSigmasPerLevel(smoothingSigmas=smooth_sigmas)
     irm.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
 
-    # callback
-    def callback(irm):
-        level = irm.GetCurrentLevel()
-        iteration = irm.GetOptimizerIteration()
-        metric = irm.GetMetricValue()
-        print("LEVEL: ", level, " ITERATION: ", iteration, " METRIC: ", metric)
+    # set callback function
+    if callback is None:
+        def callback(irm):
+            level = irm.GetCurrentLevel()
+            iteration = irm.GetOptimizerIteration()
+            metric = irm.GetMetricValue()
+            print("LEVEL: ", level, " ITERATION: ", iteration, " METRIC: ", metric)
     irm.AddCommand(sitk.sitkIterationEvent, lambda: callback(irm))
+
+    # return configured irm
     return irm
 
 
-def rigidAlign(
-    fixed, moving,
-    fixed_vox, moving_vox,
-    metric='MI',
-    number_of_histogram_bins=128,
-    metric_sampling_percentage=1.0,
-    shrink_factors=[2,1],
-    smooth_sigmas=[1,0],
-    learning_rate=1.0,
-    number_of_iterations=250,
-    target_spacing=2.0,
-    fixed_mask=None,
-    moving_mask=None,
-    fixed_origin=None,
-    moving_origin=None,
-    foreground_percentage_threshold=0.2,
+def affine_align(
+    fix, mov,
+    fix_spacing, mov_spacing,
+    rigid=True,
+    alignment_spacing=None,
+    fix_mask=None,
+    mov_mask=None,
+    fix_origin=None,
+    mov_origin=None,
+    default=np.eye(4),
+    **kwargs,
 ):
     """
     """
 
-    # if using mask, ensure there is sufficient foreground
-    if fixed_mask is not None:
-        if np.sum(fixed_mask)/np.prod(fixed_mask.shape) < foreground_percentage_threshold:
-            return np.eye(4)
-    if moving_mask is not None:
-        if np.sum(moving_mask)/np.prod(moving_mask.shape) < foreground_percentage_threshold:
-            return np.eye(4)
+    # update default if rigid is provided
+    if isinstance(rigid, np.ndarray) and np.all(default == np.eye(4)):
+        default = rigid
 
-    # skip sample
-    if target_spacing is not None:
-        fixed, fixed_vox_ss = skipSample(fixed, fixed_vox, target_spacing)
-        moving, moving_vox_ss = skipSample(moving, moving_vox, target_spacing)
+    # if using masks, ensure there is sufficient foreground
+    FOREGROUND_PERCENTAGE_THRESHOLD = 0.2
+    if fix_mask is not None:
+        foreground_percentage = np.sum(fix_mask) / np.prod(fix_mask.shape)
+        if foreground_percentage < FOREGROUND_PERCENTAGE_THRESHOLD:
+            print("Too little foreground data in fixed image")
+            print("Returning default")
+            sys.stdout.flush()
+            return default
+    if mov_mask is not None:
+        foreground_percentage = np.sum(mov_mask) / np.prod(mov_mask.shape)
+        if foreground_percentage < FOREGROUND_PERCENTAGE_THRESHOLD:
+            print("Too little foreground data in moving image")
+            print("Returning default")
+            sys.stdout.flush()
+            return default
 
-        if fixed_mask is not None:
-            fixed_mask, _ = skipSample(fixed_mask, fixed_vox, target_spacing)
-        if moving_mask is not None:
-            moving_mask, _ = skipSample(moving_mask, moving_vox, target_spacing)
+    # skip sample to alignment spacing
+    if alignment_spacing is not None:
+        fix, fix_spacing_ss = skip_sample(fix, fix_spacing, alignment_spacing)
+        mov, mov_spacing_ss = skip_sample(mov, mov_spacing, alignment_spacing)
+        if fix_mask is not None:
+            fix_mask, _ = skip_sample(fix_mask, fix_vox, alignment_spacing)
+        if mov_mask is not None:
+            mov_mask, _ = skip_sample(mov_mask, mov_vox, alignment_spacing)
+        fix_spacing = fix_spacing_ss
+        mov_spacing = mov_spacing_ss
 
-        fixed_vox = fixed_vox_ss
-        moving_vox = moving_vox_ss
-
-    # convert to sitk images, set spacing
-    fixed = numpyToSITK(fixed, fixed_vox, origin=fixed_origin)
-    moving = numpyToSITK(moving, moving_vox, origin=moving_origin)
-
-    # set up registration object, initialize
-    irm = getLinearRegistrationModel(
-        fixed_vox,
-        learning_rate,
-        number_of_iterations,
-        metric_sampling_percentage,
-        shrink_factors,
-        smooth_sigmas,
-        metric=metric,
-        number_of_histogram_bins=number_of_histogram_bins,
-    )
-    irm.SetInitialTransform(sitk.Euler3DTransform())
-
-    # set masks
-    if fixed_mask is not None:
-        fixed_mask = numpyToSITK(fixed_mask, fixed_vox, origin=fixed_origin)
-        irm.SetMetricFixedMask(fixed_mask)
-    if moving_mask is not None:
-        moving_mask = numpyToSITK(moving_mask, moving_vox, origin=moving_origin)
-        irm.SetMetricMovingMask(moving_mask)
-
-    # execute, return as ndarray
-    transform = irm.Execute(
-        sitk.Cast(fixed, sitk.sitkFloat32),
-        sitk.Cast(moving, sitk.sitkFloat32),
-    )
-
-    # get initial and final metric values
-    initial_metric_value = irm.MetricEvaluate(
-        sitk.Cast(fixed, sitk.sitkFloat32),
-        sitk.Cast(moving, sitk.sitkFloat32),
-    )
-    final_metric_value = irm.GetMetricValue()
-
-    # if registration improved the metric return result, otherwise return default identity
-    if final_metric_value < initial_metric_value:
-        etransform = sitk.Euler3DTransform()
-        etransform.SetParameters(transform.GetParameters())
-        return affineTransformToMatrix(etransform)
-    else:
-        return np.eye(4)
-
-
-def affineAlign(
-    fixed, moving,
-    fixed_vox, moving_vox,
-    rigid_matrix=None,
-    metric='MI',
-    number_of_histogram_bins=128,
-    metric_sampling_percentage=1.0,
-    shrink_factors=[2,1],
-    smooth_sigmas=[1,0],
-    learning_rate=1.0,
-    number_of_iterations=250,
-    target_spacing=2.0,
-    fixed_mask=None,
-    moving_mask=None,
-    fixed_origin=None,
-    moving_origin=None,
-    foreground_percentage_threshold=0.2,
-):
-    """
-    """
-
-    # if using mask, ensure there is sufficient foreground
-    if fixed_mask is not None:
-        if np.sum(fixed_mask)/np.prod(fixed_mask.shape) < foreground_percentage_threshold:
-            return np.eye(4)
-    if moving_mask is not None:
-        if np.sum(moving_mask)/np.prod(moving_mask.shape) < foreground_percentage_threshold:
-            return np.eye(4)
-
-    # skip sample
-    if target_spacing is not None:
-        fixed, fixed_vox_ss = skipSample(fixed, fixed_vox, target_spacing)
-        moving, moving_vox_ss = skipSample(moving, moving_vox, target_spacing)
-
-        if fixed_mask is not None:
-            fixed_mask, _ = skipSample(fixed_mask, fixed_vox, target_spacing)
-        if moving_mask is not None:
-            moving_mask, _ = skipSample(moving_mask, moving_vox, target_spacing)
-
-        fixed_vox = fixed_vox_ss
-        moving_vox = moving_vox_ss
-
-    # convert to sitk images, set spacing
-    fixed = numpyToSITK(fixed, fixed_vox, origin=fixed_origin)
-    moving = numpyToSITK(moving, moving_vox, origin=moving_origin)
-    rigid = matrixToAffineTransform(rigid_matrix)
+    # convert to sitk images
+    fix = numpy_to_sitk(fix, fix_spacing, origin=fix_origin)
+    mov = numpy_to_sitk(mov, mov_spacing, origin=mov_origin)
 
     # set up registration object
-    irm = getLinearRegistrationModel(
-        fixed_vox,
-        learning_rate,
-        number_of_iterations,
-        metric_sampling_percentage,
-        shrink_factors,
-        smooth_sigmas,
-        metric=metric,
-        number_of_histogram_bins=number_of_histogram_bins,
-    )
+    irm = configure_irm(**kwargs)
 
-    # initialize
-    affine = sitk.AffineTransform(3)
-    affine.SetMatrix(rigid.GetMatrix())
-    affine.SetTranslation(rigid.GetTranslation())
-    affine.SetCenter(rigid.GetCenter())
-    irm.SetInitialTransform(affine)
+    # set initial transform
+    if isinstance(rigid, np.ndarray):
+        transform = matrix_to_affine_transform(rigid)
+    elif not rigid:
+        transform = sitk.AffineTransform(3)
+    else:
+        transform = sitk.Euler3DTransform()
+    irm.SetInitialTransform(transform, inPlace=True)
 
     # set masks
-    if fixed_mask is not None:
-        fixed_mask = numpyToSITK(fixed_mask, fixed_vox, origin=fixed_origin)
-        irm.SetMetricFixedMask(fixed_mask)
-    if moving_mask is not None:
-        moving_mask = numpyToSITK(moving_mask, moving_vox, origin=moving_origin)
-        irm.SetMetricMovingMask(moving_mask)
+    if fix_mask is not None:
+        fix_mask = numpy_to_sitk(fix_mask, fix_spacing, origin=fix_origin)
+        irm.SetMetricFixedMask(fix_mask)
+    if mov_mask is not None:
+        mov_mask = numpy_to_sitk(mov_mask, mov_spacing, origin=mov_origin)
+        irm.SetMetricMovingMask(mov_mask)
 
-    # execute, return as ndarray
-    transform = irm.Execute(sitk.Cast(fixed, sitk.sitkFloat32),
-                            sitk.Cast(moving, sitk.sitkFloat32),
+    # execute alignment
+    irm.Execute(
+        sitk.Cast(fix, sitk.sitkFloat32),
+        sitk.Cast(mov, sitk.sitkFloat32),
     )
 
     # get initial and final metric values
     initial_metric_value = irm.MetricEvaluate(
-        sitk.Cast(fixed, sitk.sitkFloat32),
-        sitk.Cast(moving, sitk.sitkFloat32),
+        sitk.Cast(fix, sitk.sitkFloat32),
+        sitk.Cast(mov, sitk.sitkFloat32),
     )
     final_metric_value = irm.GetMetricValue()
 
-    # if registration improved the metric return result, otherwise return default identity
+    # if registration improved metric return result
+    # otherwise return default
     if final_metric_value < initial_metric_value:
-        atransform = sitk.AffineTransform(3)
-        atransform.SetParameters(transform.GetParameters())
-        return affineTransformToMatrix(atransform)
+        sys.stdout.flush()
+        return affine_transform_to_matrix(transform)
     else:
-        return rigid_matrix
+        print("Optimization failed to improve metric")
+        print("Returning default")
+        sys.stdout.flush()
+        return default
 
 
-def exhaustiveTranslation(
-    fixed, moving,
-    fixed_vox, moving_vox,
+def piecewise_affine_align(
+    fix, mov,
+    fix_spacing, mov_spacing,
+    nblocks,
+    pad=16,
+    fix_mask=None,
+    mov_mask=None,
+    cluster_kwargs={},
+    **kwargs,
+):
+    """
+    """
+
+    # get default masks
+    joint_mask = np.ones(fix.shape, dtype=np.uint8)
+    if fix_mask is not None:
+        joint_mask = np.logical_and(joint_mask, fix_mask).astype(np.uint8)
+    if mov_mask is not None:
+        joint_mask = np.logical_and(joint_mask, mov_mask).astype(np.uint8)
+
+    # get mask bounds and crop inputs
+    bounds = find_objects(joint_mask, max_label=1)[0]
+    starts = [max(bounds[ax].start - pad, 0) for ax in range(3)]
+    stops = [min(bounds[ax].stop + pad, fix.shape[ax]) for ax in range(3)]
+    slc = tuple([slice(x, y) for x, y in zip(starts, stops)])
+    fix_c = fix[slc]
+    mov_c = mov[slc]
+    fm_c = fix_mask[slc] if fix_mask is not None else joint_mask[slc]
+    mm_c = mov_mask[slc] if mov_mask is not None else joint_mask[slc]
+
+    # compute block size and overlaps
+    blocksize = np.array(fix_c.shape).astype(np.float32) / nblocks
+    blocksize = np.ceil(blocksize).astype(np.int16)
+    overlaps = blocksize // 2
+
+    # set cluster defaults
+    if 'cores' not in cluster_kwargs.keys():
+        cluster_kwargs['cores'] = 2
+
+    # set up cluster
+    with ClusterWrap.cluster(**cluster_kwargs) as cluster:
+        cluster.scale_cluster(np.prod(nblocks)+1)
+
+        # construct dask array versions of objects
+        fix_da = da.from_array(fix_c)
+        mov_da = da.from_array(mov_c)
+        fm_da = da.from_array(fm_c)
+        mm_da = da.from_array(mm_c)
+
+        # pad the ends to fill in the last blocks
+        # blocks must all be exact for stitch to work correctly
+        orig_sh = fix_da.shape
+        pads = [(0, y - x % y) if x % y > 0
+            else (0, 0) for x, y in zip(orig_sh, blocksize)]
+        fix_da = da.pad(fix_da, pads).rechunk(tuple(blocksize))
+        mov_da = da.pad(mov_da, pads).rechunk(tuple(blocksize))
+        fm_da = da.pad(fm_da, pads).rechunk(tuple(blocksize))
+        mm_da = da.pad(mm_da, pads).rechunk(tuple(blocksize))
+
+        # closure for rigid align function
+        def single_rigid_align(fix, mov, fm, mm):
+            rigid = affine_align(
+                fix, mov, fix_spacing, mov_spacing,
+                fix_mask=fm, mov_mask=mm,
+                **kwargs,
+            )
+            return rigid.reshape((1,1,1,4,4))
+
+        # rigid align all chunks
+        rigids = da.map_overlap(
+            single_rigid_align, fix_da, mov_da, fm_da, mm_da,
+            depth=tuple(overlaps),
+            dtype=np.float32,
+            boundary='none',
+            trim=False,
+            align_arrays=False,
+            new_axis=[3,4],
+            chunks=[1,1,1,4,4],
+        ).compute()
+
+        # closure for affine align function
+        def single_affine_align(fix, mov, fm, mm, block_info=None):
+            block_idx = block_info[0]['chunk-location']
+            rigid = rigids[block_idx[0], block_idx[1], block_idx[2]]
+            affine = affine_align(
+                fix, mov, fix_spacing, mov_spacing,
+                fix_mask=fm, mov_mask=mm, rigid=rigid,
+                **kwargs,
+            )
+            return affine.reshape((1,1,1,4,4))
+
+        # affine align all chunks
+        affines = da.map_overlap(
+            single_affine_align, fix_da, mov_da, fm_da, mm_da,
+            depth=tuple(overlaps),
+            dtype=np.float32,
+            boundary='none',
+            trim=False,
+            align_arrays=False,
+            new_axis=[3,4],
+            chunks=[1,1,1,4,4],
+        ).compute()
+
+        # stitching is very memory intensive, use smaller field size for stitching
+        stitch_sh = np.array(orig_sh).astype(np.int16) // 2
+        stitch_blocksize = blocksize // 2
+        stitch_spacing = fix_spacing * 2.
+
+        # convert local affines to displacement vector field
+        stitch_field = stitch.local_affine_to_displacement(
+            stitch_sh, stitch_spacing, affines, stitch_blocksize,
+        ).compute()
+
+        # resample field back to correct size
+        field = np.empty(orig_sh + (3,), dtype=np.float32)
+        stitch_sh = np.array(stitch_field.shape[:-1])
+        for i in range(3):
+            field[..., i] = zoom(stitch_field[..., i], orig_sh/stitch_sh, order=1)
+
+        # pad back to original shape
+        pads = [(x, z-y) for x, y, z in zip(starts, stops, fix.shape)]
+        pads += [(0, 0),]  # vector dimension
+
+        return np.pad(field, pads)
+
+
+def exhaustive_translation(
+    fix, mov,
+    fix_spacing, mov_spacing,
     num_steps, step_sizes,
-    fixed_origin=None,
-    moving_origin=None,
+    fix_origin=None,
+    mov_origin=None,
     peak_ratio=1.2,
-    bins=128,
+    **kwargs,
 ):
     """
     """
 
     # squeeze any negligible dimensions
-    fixed = fixed.squeeze()
-    moving = moving.squeeze()
+    fix = fix.squeeze()
+    mov = mov.squeeze()
 
     # convert to sitk images
-    fix_itk = numpyToSITK(fixed, fixed_vox, origin=fixed_origin)
-    mov_itk = numpyToSITK(moving, moving_vox, origin=moving_origin)
+    fix_itk = numpy_to_sitk(fix, fix_spacing, origin=fix_origin)
+    mov_itk = numpy_to_sitk(mov, mov_spacing, origin=mov_origin)
 
-    # initialize image registration method
-    ncores = int(os.environ["LSB_DJOB_NUMPROC"])  # TODO: LSF specific!
-    sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(2*ncores)
-    irm = sitk.ImageRegistrationMethod()
-    irm.SetNumberOfThreads(2*ncores)
-
-    # set interpolation
-    irm.SetInterpolator(sitk.sitkLinear)
-
-    # set metric
-    irm.SetMetricAsMattesMutualInformation(
-        numberOfHistogramBins=bins,
-    )
-
-    # set exhaustive optimizer
-    irm.SetOptimizerAsExhaustive(num_steps[::-1])
-    irm.SetOptimizerScales(step_sizes[::-1])
-
-    # set translation transform
-    tx = sitk.TranslationTransform(3)
-    irm.SetInitialTransform(tx)
-
-    # keep track of alignment scores
+    # define callback: keep track of alignment scores
     scores = np.zeros(tuple(2*x+1 for x in num_steps[::-1]), dtype=np.float32)
     def callback(irm):
         iteration = irm.GetOptimizerIteration()
@@ -394,8 +408,18 @@ def exhaustiveTranslation(
         scores[indx[0], indx[1], indx[2]] = irm.GetMetricValue()
     irm.AddCommand(sitk.sitkIterationEvent, lambda: callback(irm))
 
+    # get irm
+    kwargs['optimizer'] = 'EX'
+    kwargs['num_steps'] = num_steps
+    kwargs['step_sizes'] = step_sizes
+    kwargs['callback'] = callback
+    irm = configure_irm(**kwargs)
+
+    # set translation transform
+    irm.SetInitialTransform(sitk.TranslationTransform(3), inPlace=True)
+
     # align
-    transform = irm.Execute(
+    irm.Execute(
         sitk.Cast(fix_itk, sitk.sitkFloat32),
         sitk.Cast(mov_itk, sitk.sitkFloat32),
     )
@@ -418,205 +442,7 @@ def exhaustiveTranslation(
     return trans[::-1]
 
 
-def piecewiseAffineSingleAxis(
-    fixed, moving,
-    fixed_vox, moving_vox,
-    axis, nblocks, pad=16,
-    fixed_mask=None, moving_mask=None,
-    **kwargs,
-):
-    """
-    """
-
-    # get mask
-    mask = np.ones(fixed.shape, dtype=np.uint8)
-    if fixed_mask is not None:
-        mask = np.logical_and(mask, fixed_mask)
-    if moving_mask is not None:
-        mask = np.logical_and(mask, moving_mask)
-
-    # get start, stop, and stride
-    bounds = find_objects(mask, max_label=1)
-    start = max(bounds[0][axis].start - pad, 0)
-    stop = min(bounds[0][axis].stop + pad, fixed.shape[axis])
-    stride = np.ceil( (stop - start)/(nblocks + 1) ).astype(np.uint16)
-
-    # create weights array
-    # blocks overlap by 50%, block size is 2*stride
-    sh = np.ones(4, dtype=int)
-    sh[axis] = int(2*stride)
-    w = np.linspace(0, 1., stride)
-    weights = np.concatenate((w, w[::-1])).reshape(sh)
-
-    # piecewise affine align
-    piecewise_affine_deform = np.zeros(fixed.shape + (3,))
-    for s in range(start, stop-stride, stride):
-
-        # get chunks
-        slc = [slice(None, None),]*3
-        slc[axis] = slice(s, s+2*stride)
-        f, m = fixed[slc], moving[slc]
-
-        # get mask chunks if applicable
-        fm = fixed_mask[slc] if fixed_mask is not None else mask[slc]
-        mm = moving_mask[slc] if moving_mask is not None else mask[slc]
-
-        # align
-        rigid_sitk = rigidAlign(
-            f, m, fixed_vox, moving_vox, fixed_mask=fm, moving_mask=mm, **kwargs,
-        )
-        affine_sitk = affineAlign(
-            f, m, fixed_vox, moving_vox, rigid_matrix=rigid_sitk,
-            fixed_mask=fm, moving_mask=mm, **kwargs,
-        )
-
-        # correct transform for backward SimpleITK axis conventions
-        affine = sitkAxesToConventionalAxes(affine_sitk)
-
-        # convert to vector field
-        field = matrixToDisplacementField(f, affine, fixed_vox)
-
-        # multiply by weights
-        if field.shape[axis] == weights.shape[axis]:
-            field = field * weights
-        else:
-            w_slc = [slice(None, None),]*4
-            w_slc[axis] = slice(None, field.shape[axis])
-            field = field * weights[w_slc]
-
-        # assign
-        piecewise_affine_deform[slc] += field
-
-    # return result
-    return piecewise_affine_deform
-
-
-def distributedPiecewiseAffine(
-    fixed, moving,
-    fixed_vox, moving_vox,
-    nblocks, pad=16,
-    fixed_mask=None, moving_mask=None,
-    foreground_percentage_threshold=0.2,
-    **kwargs,
-    ):
-    """
-    """
-
-    # set up cluster
-    with csd.distributedState() as ds:
-
-        # TODO: expose cores/tpw, remove job_extra -P
-        ds.initializeLSFCluster(
-        cores=2, memory="30GB", ncpus=2, mem=30000000, threads_per_worker=4,
-        walltime="3:59", project="ahrens",
-        )
-        ds.initializeClient()
-        ds.scaleCluster(njobs=np.prod(nblocks)+1)
-
-        # get mask
-        mask = np.ones(fixed.shape, dtype=np.uint8)
-        if fixed_mask is not None:
-            mask = np.logical_and(mask, fixed_mask)
-        if moving_mask is not None:
-            mask = np.logical_and(mask, moving_mask)
-    
-        # get mask bounds and crop inputs
-        bounds = find_objects(mask, max_label=1)
-        starts = [max(bounds[0][ax].start - pad, 0) for ax in range(3)]
-        stops = [min(bounds[0][ax].stop + pad, fixed.shape[ax]) for ax in range(3)]
-        slc = tuple([slice(x, y) for x, y in zip(starts, stops)])
-        fixed_c = fixed[slc]
-        moving_c = moving[slc]
-        fm_c = fixed_mask[slc] if fixed_mask is not None else mask[slc]
-        mm_c = moving_mask[slc] if moving_mask is not None else mask[slc]
-
-        # construct dask array versions of objects
-        fixed_da = da.from_array(fixed_c)
-        moving_da = da.from_array(moving_c)
-        fm_da = da.from_array(fm_c)
-        mm_da = da.from_array(mm_c)
-
-        # compute block size and overlaps
-        blocksize = np.array(fixed_c.shape).astype(np.float32) / nblocks
-        blocksize = np.ceil(blocksize).astype(np.int16)
-        overlaps = blocksize // 2
-
-        # pad the ends to fill in the last blocks
-        orig_sh = fixed_da.shape
-        pads = [(0, y - x % y) if x % y > 0 else (0, 0) for x, y in zip(orig_sh, blocksize)]
-        fixed_da = da.pad(fixed_da, pads).rechunk(tuple(blocksize))
-        moving_da = da.pad(moving_da, pads).rechunk(tuple(blocksize))
-        fm_da = da.pad(fm_da, pads).rechunk(tuple(blocksize))
-        mm_da = da.pad(mm_da, pads).rechunk(tuple(blocksize))
-
-        # closure for rigid align function
-        def my_rigid_align(fix, mov, fm, mm):
-            rigid = rigidAlign(
-                fix, mov, fixed_vox, moving_vox,
-                fixed_mask=fm, moving_mask=mm, **kwargs,
-            )
-            return rigid.reshape((1,1,1,4,4))
-
-        # rigid align all chunks
-        rigids = da.map_overlap(
-            my_rigid_align, fixed_da, moving_da, fm_da, mm_da,
-            depth=tuple(overlaps),
-            dtype=np.float32,
-            boundary=0,
-            trim=False,
-            align_arrays=False,
-            new_axis=[3,4],
-            chunks=[1,1,1,4,4],
-        ).compute()
-
-        # closure for affine align function
-        def my_affine_align(fix, mov, fm, mm, block_info=None):
-            block_idx = block_info[None]['chunk-location']
-            rigid = rigids[block_idx[0], block_idx[1], block_idx[2]]
-            affine_sitk = affineAlign(
-                fix, mov, fixed_vox, moving_vox,
-                fixed_mask=fm, moving_mask=mm, rigid_matrix=rigid,
-                **kwargs,
-            )
-            affine = sitkAxesToConventionalAxes(affine_sitk)
-            return affine.reshape((1,1,1,4,4))
-
-        # affine align all chunks
-        affines = da.map_overlap(
-            my_affine_align, fixed_da, moving_da, fm_da, mm_da,
-            depth=tuple(overlaps),
-            dtype=np.float32,
-            boundary=0,
-            trim=False,
-            align_arrays=False,
-            new_axis=[3,4],
-            chunks=[1,1,1,4,4],
-        ).compute()
-
-        # stitching is very memory intensive, use smaller field size for stitching
-        stitch_sh = np.array(orig_sh).astype(np.int16) // 2
-        stitch_blocksize = blocksize // 2
-        stitch_vox = fixed_vox * 2.
-
-        # convert local affines to displacement vector field
-        stitch_field = stitch.local_affine_to_displacement(
-            stitch_sh, stitch_vox, affines, stitch_blocksize,
-        ).compute()
-
-        # resample field back to correct size
-        field = np.empty(orig_sh + (3,), dtype=np.float32)
-        stitch_sh = np.array(stitch_field.shape[:-1])
-        for i in range(3):
-            field[..., i] = zoom(stitch_field[..., i], orig_sh/stitch_sh, order=1)
-
-        # pad back to original shape
-        pads = [(x, z-y) for x, y, z in zip(starts, stops, fixed.shape)]
-        pads += [(0, 0),]  # vector dimension
-
-        return np.pad(field, pads)
-
-
-def distributedNestedExhaustiveRigid(
+def piecewise_exhaustive_translation(
     fixed, moving, mask,
     fixed_vox, moving_vox,
     query_radius,
@@ -714,7 +540,7 @@ def distributedNestedExhaustiveRigid(
         return dvf_s
 
 
-def deformableAlign(
+def deformable_align(
     fixed, moving,
     fixed_vox, moving_vox,
     radius=32,
@@ -744,7 +570,7 @@ def deformableAlign(
     return register.get_warp()
 
 
-def distributedDeformableAlign(
+def piecewise_deformable_align(
     fixed, moving,
     fixed_vox, moving_vox,
     affine_matrix,
@@ -756,7 +582,7 @@ def distributedDeformableAlign(
     """
 
     # reasmple moving image with affine
-    moving_res = applyTransformToImage(
+    moving_res = apply_transform(
         fixed, moving,
         fixed_vox, moving_vox,
         matrix=affine_matrix
@@ -812,49 +638,50 @@ def distributedDeformableAlign(
         ).compute()
 
     # TODO: TEMP
-    resampled = applyTransformToImage(
+    resampled = apply_transform(
        fixed, moving_res, fixed_vox, fixed_vox, displacement=deformation
     )
 
     return deformation, resampled
 
 
-def applyTransformToImage(
-    fixed, moving,
-    fixed_vox, moving_vox,
+def apply_transform(
+    fix, mov,
+    fix_spacing, mov_spacing,
     transform_list,
     transform_spacing=None,
-    fixed_orig=None, moving_orig=None,
+    fix_origin=None,
+    mov_origin=None,
     ):
     """
     """
 
     # convert images to sitk objects
-    dtype = fixed.dtype
-    fixed = numpyToSITK(fixed, fixed_vox, fixed_orig)
-    moving = numpyToSITK(moving, moving_vox, moving_orig)
+    dtype = fix.dtype
+    fix = numpy_to_sitk(fix, fix_spacing, fix_origin)
+    mov = numpy_to_sitk(mov, mov_spacing, mov_origin)
 
     # default transform spacing is fixed voxel spacing 
     if transform_spacing is None:
-        transform_spacing = fixed_vox
+        transform_spacing = fix_spacing
 
     # construct transform
     transform = sitk.CompositeTransform(3)
     for t in transform_list:
         if len(t.shape) == 2:
-            t = matrixToAffineTransform(t)
+            t = matrix_to_affine_transform(t)
         elif len(t.shape) == 4:
-            t = fieldToDisplacementFieldTransform(t, transform_spacing)
+            t = field_to_displacement_field_transform(t, transform_spacing)
         transform.AddTransform(t)
 
     # set up resampler object
     resampler = sitk.ResampleImageFilter()
-    resampler.SetReferenceImage(sitk.Cast(fixed, sitk.sitkFloat32))
+    resampler.SetReferenceImage(sitk.Cast(fix, sitk.sitkFloat32))
     resampler.SetInterpolator(sitk.sitkLinear)
     resampler.SetDefaultPixelValue(0)
     resampler.SetTransform(transform)
 
     # execute, return as numpy array
-    resampled = resampler.Execute(sitk.Cast(moving, sitk.sitkFloat32))
+    resampled = resampler.Execute(sitk.Cast(mov, sitk.sitkFloat32))
     return sitk.GetArrayFromImage(resampled).astype(dtype)
 

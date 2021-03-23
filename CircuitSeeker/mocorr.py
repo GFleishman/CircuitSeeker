@@ -2,14 +2,14 @@ from glob import glob
 import numpy as np
 import os
 
+import ClusterWrap
 import CircuitSeeker.fileio as csio
-import CircuitSeeker.distributed as csd
 import dask.array as da
 import dask.bag as db
 import dask.delayed as delayed
 
 import SimpleITK as sitk
-from scipy.ndimage import percentile_filter, gaussian_filter1d
+from scipy.ndimage import median_filter, gaussian_filter1d
 import zarr
 from numcodecs import Blosc
 
@@ -38,16 +38,6 @@ def rigidAlign(
     target_spacing=2.0,
 ):
     """
-    Returns rigid transform parameters aligning `fixed` coords to `moving` coords
-    `fixed` and `moving` must be numpy arrays or file paths
-    `fixed_vox` and `moving_vox` must be fixed and moving image voxel spacings as numpy arrays
-    if `fixed` and/or `moving` are hdf5 filepaths, you must specify `dataset_path`
-    remaining arguments adjust the rigid registration algorithm
-
-    Images are skip sub-sampled before registration. The skip stride is determined by
-    `target_spacing` which is the target voxel spacing after skip sub-sampling.
-    Images are never up-sampled so axes with spacing greater than `target_spacing` are
-    not skip sub-sampled.
     """
 
     # get moving/fixed images as ndarrays
@@ -155,87 +145,75 @@ def _parametersToRigidMatrix(params):
 
 # TODO: refactor motionCorrect
 def motionCorrect(
-    folder, prefix, suffix,
-    fixed, fixed_vox, moving_vox,
-    write_path, dataset_path=None,
-    distributed_state=None, sigma=7,
-    transforms_dir=None,
+    fixed, frames,
+    fixed_spacing, frames_spacing,
+    write_path,
+    sigma=7,
+    cluster_kwargs={},
     **kwargs,
 ):
     """
     """
 
-    # set up the distributed environment
-    ds = distributed_state
-    if distributed_state is None:
-        ds = csd.distributedState()
+    with ClusterWrap.cluster(**cluster_kwargs) as cluster:
+
         # writing large compressed chunks locks GIL for a long time
-        ds.modifyConfig({'distributed.comm.timeouts.connect':'60s',
-                         'distributed.comm.timeouts.tcp':'180s',}
+        cluster.modify_dask_config(
+            {'distributed.comm.timeouts.connect':'60s',
+             'distributed.comm.timeouts.tcp':'180s',}
         )
-        ds.initializeLSFCluster(job_extra=["-P scicompsoft"])
-        ds.initializeClient()
 
-    # create (lazy) dask bag from all frames
-    frames = csio.daskBagOfFilePaths(folder, prefix, suffix)
-    nframes = frames.npartitions
+        # create dask array of all frames
+        frames_data = csio.daskArrayBackedByHDF5(
+            frames['folder'], frames['prefix'],
+            frames['suffix'], frames['dataset_path'],
+        )
+        nframes = frames.shape[0]
 
-    # scale cluster carefully
-    if 'max_workers' in kwargs.keys():
-        max_workers = kwargs['max_workers']
-    else:
+        # scale cluster carefully
         max_workers = 1250
-    ds.scaleCluster(njobs=min(nframes, max_workers))
-
-    # align all
-    dfixed = delayed(fixed)
-    dfixed_vox = delayed(fixed_vox)
-    dmoving_vox = delayed(moving_vox)
-    ddataset_path = delayed(dataset_path)
-    params = frames.map(lambda b,w,x,y,z: rigidAlign(w,b,x,y, dataset_path=z),
-        w=dfixed, x=dfixed_vox, y=dmoving_vox, z=ddataset_path,
-    ).compute()
-    params = np.array(list(params))
-
-    # (weak) outlier removal and smoothing
-    params = percentile_filter(params, 50, footprint=np.ones((3,1)))
-    params = gaussian_filter1d(params, sigma, axis=0)
-
-    # write transforms as matrices
-    if transforms_dir is not None:
-        paths = list(frames)
-        for ind, p in enumerate(params):
-            transform = _parametersToRigidMatrix(p)
-            basename = os.path.splitext(os.path.basename(paths[ind]))[0]
-            path = os.path.join(transforms_dir, basename) + '_rigid.mat'
-            np.savetxt(path, transform)
-
-    # apply transforms to all images
-    params = db.from_sequence(params, npartitions=nframes)
-    transformed = frames.map(lambda b,x,y,z: applyTransform(b,x,y, dataset_path=z),
-        x=dmoving_vox, y=params, z=ddataset_path,
-    ).to_delayed()
-
-    # convert to a (lazy) 4D dask array
-    sh = transformed[0][0].shape.compute()
-    dd = transformed[0][0].dtype.compute()
-    arrays = [da.from_delayed(t[0], sh, dtype=dd) for t in transformed]
-    transformed = da.stack(arrays, axis=0)
-
-    # write in parallel as 4D array to zarr file
-    compressor = Blosc(cname='zstd', clevel=9, shuffle=Blosc.BITSHUFFLE)
-    transformed_disk = zarr.open(write_path, 'w',
-        shape=transformed.shape, chunks=(256, 10, 256, 256),
-        dtype=transformed.dtype, compressor=compressor
-    )
-    da.to_zarr(transformed, transformed_disk)
-
-    # release resources
-    if distributed_state is None:
-        ds.closeClient()
-
-    # return reference to data on disk
-    return transformed_disk
+        if 'max_workers' in kwargs.keys():
+            max_workers = kwargs['max_workers']
+        cluster.scale_cluster(min(nframes, max_workers))
+ 
+        # align all
+        
+    
+        # (weak) outlier removal and smoothing
+        params = median_filter(params, footprint=np.ones((3,1)))
+        params = gaussian_filter1d(params, sigma, axis=0)
+    
+        # write transforms as matrices
+        if transforms_dir is not None:
+            paths = list(frames)
+            for ind, p in enumerate(params):
+                transform = _parametersToRigidMatrix(p)
+                basename = os.path.splitext(os.path.basename(paths[ind]))[0]
+                path = os.path.join(transforms_dir, basename) + '_rigid.mat'
+                np.savetxt(path, transform)
+    
+        # apply transforms to all images
+        params = db.from_sequence(params, npartitions=nframes)
+        transformed = frames.map(lambda b,x,y,z: applyTransform(b,x,y, dataset_path=z),
+            x=dmoving_vox, y=params, z=ddataset_path,
+        ).to_delayed()
+    
+        # convert to a (lazy) 4D dask array
+        sh = transformed[0][0].shape.compute()
+        dd = transformed[0][0].dtype.compute()
+        arrays = [da.from_delayed(t[0], sh, dtype=dd) for t in transformed]
+        transformed = da.stack(arrays, axis=0)
+    
+        # write in parallel as 4D array to zarr file
+        compressor = Blosc(cname='zstd', clevel=9, shuffle=Blosc.BITSHUFFLE)
+        transformed_disk = zarr.open(write_path, 'w',
+            shape=transformed.shape, chunks=(256, 10, 256, 256),
+            dtype=transformed.dtype, compressor=compressor
+        )
+        da.to_zarr(transformed, transformed_disk)
+    
+        # return reference to data on disk
+        return transformed_disk
 
 
 def distributedImageMean(

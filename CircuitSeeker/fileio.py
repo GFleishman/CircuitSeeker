@@ -56,7 +56,7 @@ def daskArrayBackedByHDF5(folder, prefix, suffix, dataset_path):
     assert (testPathExtensionForHDF5(suffix)), error_message
     images = globPaths(folder, prefix, suffix)
     dsets = [readHDF5(image, dataset_path) for image in images]
-    arrays = [da.from_array(dset, chunks=(256,)*dset.ndim) for dset in dsets]
+    arrays = [da.from_array(dset, chunks=dset.shape) for dset in dsets]
     return da.stack(arrays, axis=0)
 
 

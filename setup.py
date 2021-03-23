@@ -17,7 +17,6 @@ setuptools.setup(
         'dask',
         'dask[array]',
         'dask[bag]',
-        'dask[dataframe]',
         'dask[delayed]',
         'dask[distributed]',
         'dask-jobqueue',
@@ -25,5 +24,6 @@ setuptools.setup(
         'zarr',
         'numcodecs',
         'morphsnakes',
+        'ClusterWrap',
     ]
 )
