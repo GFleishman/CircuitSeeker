@@ -268,24 +268,13 @@ def piecewise_affine_align(
     """
 
     # get default masks
-    joint_mask = np.ones(fix.shape, dtype=np.uint8)
-    if fix_mask is not None:
-        joint_mask = np.logical_and(joint_mask, fix_mask).astype(np.uint8)
-    if mov_mask is not None:
-        joint_mask = np.logical_and(joint_mask, mov_mask).astype(np.uint8)
-
-    # get mask bounds and crop inputs
-    bounds = find_objects(joint_mask, max_label=1)[0]
-    starts = [max(bounds[ax].start - pad, 0) for ax in range(3)]
-    stops = [min(bounds[ax].stop + pad, fix.shape[ax]) for ax in range(3)]
-    slc = tuple([slice(x, y) for x, y in zip(starts, stops)])
-    fix_c = fix[slc]
-    mov_c = mov[slc]
-    fm_c = fix_mask[slc] if fix_mask is not None else joint_mask[slc]
-    mm_c = mov_mask[slc] if mov_mask is not None else joint_mask[slc]
+    if fix_mask is None:
+        fix_mask = np.ones(fix.shape, dtype=np.uint8)
+    if mov_mask is None:
+        mov_mask = np.ones(mov.shape, dtype=np.uint8) 
 
     # compute block size and overlaps
-    blocksize = np.array(fix_c.shape).astype(np.float32) / nblocks
+    blocksize = np.array(fix.shape).astype(np.float32) / nblocks
     blocksize = np.ceil(blocksize).astype(np.int16)
     overlaps = blocksize // 2
 
@@ -298,16 +287,15 @@ def piecewise_affine_align(
         cluster.scale_cluster(np.prod(nblocks)+1)
 
         # construct dask array versions of objects
-        fix_da = da.from_array(fix_c)
-        mov_da = da.from_array(mov_c)
-        fm_da = da.from_array(fm_c)
-        mm_da = da.from_array(mm_c)
+        fix_da = da.from_array(fix)
+        mov_da = da.from_array(mov)
+        fm_da = da.from_array(fix_mask)
+        mm_da = da.from_array(mov_mask)
 
         # pad the ends to fill in the last blocks
         # blocks must all be exact for stitch to work correctly
-        orig_sh = fix_da.shape
         pads = [(0, y - x % y) if x % y > 0
-            else (0, 0) for x, y in zip(orig_sh, blocksize)]
+            else (0, 0) for x, y in zip(fix.shape, blocksize)]
         fix_da = da.pad(fix_da, pads).rechunk(tuple(blocksize))
         mov_da = da.pad(mov_da, pads).rechunk(tuple(blocksize))
         fm_da = da.pad(fm_da, pads).rechunk(tuple(blocksize))
@@ -357,27 +345,24 @@ def piecewise_affine_align(
             chunks=[1,1,1,4,4],
         ).compute()
 
-        # stitching is very memory intensive, use smaller field size for stitching
-        stitch_sh = np.array(orig_sh).astype(np.int16) // 2
-        stitch_blocksize = blocksize // 2
-        stitch_spacing = fix_spacing * 2.
+        # adjust affines for block origins
+        for i in range(np.prod(nblocks)):
+            x, y, z = np.unravel_index(i, nblocks)
+            origin = np.maximum(
+                np.array(blocksize) * [x, y, z] - overlaps, 0,
+            )
+            origin = origin * fix_spacing
+            tl, tr = np.eye(4), np.eye(4)
+            tl[:3, -1], tr[:3, -1] = origin, -origin
+            a = affines[x, y, z]
+            affines[x, y, z] = np.matmul(tl, np.matmul(a, tr))
 
-        # convert local affines to displacement vector field
-        stitch_field = stitch.local_affine_to_displacement(
-            stitch_sh, stitch_spacing, affines, stitch_blocksize,
+        # stitch local affines into displacement field
+        field = stitch.local_affine_to_displacement(
+            fix.shape, fix_spacing, affines, blocksize,
         ).compute()
 
-        # resample field back to correct size
-        field = np.empty(orig_sh + (3,), dtype=np.float32)
-        stitch_sh = np.array(stitch_field.shape[:-1])
-        for i in range(3):
-            field[..., i] = zoom(stitch_field[..., i], orig_sh/stitch_sh, order=1)
-
-        # pad back to original shape
-        pads = [(x, z-y) for x, y, z in zip(starts, stops, fix.shape)]
-        pads += [(0, 0),]  # vector dimension
-
-        return np.pad(field, pads)
+        return field
 
 
 def exhaustive_translation(

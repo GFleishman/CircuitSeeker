@@ -139,21 +139,36 @@ def local_affine_to_displacement(shape, spacing, affines, blocksize):
     """
     """
 
-    # augment the blocksize by the fixed overlap size
-    pads = [2*(x//2) for x in blocksize]
-    blocksize_with_overlap = list(np.array(blocksize) + pads)
-
     # get a grid used for each affine
-    grid = position_grid(blocksize_with_overlap, blocksize_with_overlap)
+    grid = position_grid(
+        np.array(blocksize) * affines.shape[:3],
+        list(blocksize),
+    )
     grid = grid * spacing.astype(np.float32)
+    grid = grid[..., None]  # needed for map_overlap
 
     # wrap local_affines as dask array
-    affines_da = da.from_array(affines, chunks=(1, 1, 1, 4, 4))
+    affines_da = da.from_array(
+        affines.astype(np.float32),
+        chunks=(1, 1, 1, 4, 4),
+    )
+
+    # strip dummy axis off grid
+    def wrapped_affine_to_grid(x, y):
+        y = y.squeeze()
+        return affine_to_grid(x, y)
 
     # compute affine transforms as displacement fields, lazy dask arrays
-    coords = da.map_blocks(
-        affine_to_grid, affines_da, grid=grid,
-        new_axis=[5,6], chunks=(1,1,1,)+tuple(grid.shape), dtype=np.float32,
+    overlaps = list(blocksize // 2)
+    coords = da.map_overlap(
+        wrapped_affine_to_grid, affines_da, grid,
+        depth=[0, tuple(overlaps)+(0,)],
+        boundary=0,
+        trim=False,
+        align_arrays=False,
+        dtype=np.float32,
+        new_axis=[5,6],
+        chunks=(1,1,1,)+tuple(x+2*y for x, y in zip(blocksize, overlaps)) + (3,),
     )
 
     # stitch affine position fields
