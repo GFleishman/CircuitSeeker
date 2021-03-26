@@ -1,85 +1,12 @@
-import numpy as np
 import os, sys
-import CircuitSeeker.stitch as stitch
+import numpy as np
 import dask.array as da
-import greedypy.greedypy_registration_method as grm
 import SimpleITK as sitk
-from scipy.ndimage import find_objects, zoom
-from scipy.ndimage import minimum_filter, gaussian_filter
 import ClusterWrap
-
-
-def skip_sample(image, spacing, ss_spacing):
-    """
-    """
-
-    ss = np.maximum(np.round(ss_spacing / spacing), 1).astype(np.int)
-    image = image[::ss[0], ::ss[1], ::ss[2]]
-    spacing = spacing * ss
-    return image, spacing
-
-
-def numpy_to_sitk(image, spacing, origin=None, vector=False):
-    """
-    """
-
-    image = sitk.GetImageFromArray(image.copy(), isVector=vector)
-    image.SetSpacing(spacing[::-1])
-    if origin is None:
-        origin = np.zeros(len(spacing))
-    image.SetOrigin(origin[::-1])
-    return image
-
-
-def invert_matrix_axes(matrix):
-    """
-    """
-
-    corrected = np.eye(4)
-    corrected[:3, :3] = matrix[:3, :3][::-1, ::-1]
-    corrected[:3, -1] = matrix[:3, -1][::-1]
-    return corrected
-
-
-def affine_transform_to_matrix(transform):
-    """
-    """
-
-    matrix = np.eye(4)
-    matrix[:3, :3] = np.array(transform.GetMatrix()).reshape((3,3))
-    matrix[:3, -1] = np.array(transform.GetTranslation())
-    return invert_matrix_axes(matrix)
-
-
-def matrix_to_affine_transform(matrix):
-    """
-    """
-
-    matrix_sitk = invert_matrix_axes(matrix)
-    transform = sitk.AffineTransform(3)
-    transform.SetMatrix(matrix_sitk[:3, :3].flatten())
-    transform.SetTranslation(matrix_sitk[:3, -1].squeeze())
-    return transform
-
-
-def matrix_to_displacement_field(reference, matrix, spacing):
-    """
-    """
-
-    nrows, ncols, nstacks = reference.shape
-    grid = np.array(np.mgrid[:nrows, :ncols, :nstacks]).transpose(1,2,3,0)
-    grid = grid * spacing
-    mm, tt = matrix[:3, :3], matrix[:3, -1]
-    return np.einsum('...ij,...j->...i', mm, grid) + tt - grid
-
-
-def field_to_displacement_field_transform(field, spacing):
-    """
-    """
-
-    field = field.astype(np.float64)
-    transform = numpy_to_sitk(field, spacing, vector=True)
-    return sitk.DisplacementFieldTransform(transform)
+import CircuitSeeker.stitch as stitch
+import CircuitSeeker.utility as ut
+import greedypy.greedypy_registration_method as grm
+from scipy.ndimage import minimum_filter, gaussian_filter
 
 
 def configure_irm(
@@ -196,25 +123,25 @@ def affine_align(
 
     # skip sample to alignment spacing
     if alignment_spacing is not None:
-        fix, fix_spacing_ss = skip_sample(fix, fix_spacing, alignment_spacing)
-        mov, mov_spacing_ss = skip_sample(mov, mov_spacing, alignment_spacing)
+        fix, fix_spacing_ss = ut.skip_sample(fix, fix_spacing, alignment_spacing)
+        mov, mov_spacing_ss = ut.skip_sample(mov, mov_spacing, alignment_spacing)
         if fix_mask is not None:
-            fix_mask, _ = skip_sample(fix_mask, fix_vox, alignment_spacing)
+            fix_mask, _ = ut.skip_sample(fix_mask, fix_vox, alignment_spacing)
         if mov_mask is not None:
-            mov_mask, _ = skip_sample(mov_mask, mov_vox, alignment_spacing)
+            mov_mask, _ = ut.skip_sample(mov_mask, mov_vox, alignment_spacing)
         fix_spacing = fix_spacing_ss
         mov_spacing = mov_spacing_ss
 
     # convert to sitk images
-    fix = numpy_to_sitk(fix, fix_spacing, origin=fix_origin)
-    mov = numpy_to_sitk(mov, mov_spacing, origin=mov_origin)
+    fix = ut.numpy_to_sitk(fix, fix_spacing, origin=fix_origin)
+    mov = ut.numpy_to_sitk(mov, mov_spacing, origin=mov_origin)
 
     # set up registration object
     irm = configure_irm(**kwargs)
 
     # set initial transform
     if isinstance(rigid, np.ndarray):
-        transform = matrix_to_affine_transform(rigid)
+        transform = ut.matrix_to_affine_transform(rigid)
     elif not rigid:
         transform = sitk.AffineTransform(3)
     else:
@@ -223,10 +150,10 @@ def affine_align(
 
     # set masks
     if fix_mask is not None:
-        fix_mask = numpy_to_sitk(fix_mask, fix_spacing, origin=fix_origin)
+        fix_mask = ut.numpy_to_sitk(fix_mask, fix_spacing, origin=fix_origin)
         irm.SetMetricFixedMask(fix_mask)
     if mov_mask is not None:
-        mov_mask = numpy_to_sitk(mov_mask, mov_spacing, origin=mov_origin)
+        mov_mask = ut.numpy_to_sitk(mov_mask, mov_spacing, origin=mov_origin)
         irm.SetMetricMovingMask(mov_mask)
 
     # execute alignment
@@ -246,7 +173,7 @@ def affine_align(
     # otherwise return default
     if final_metric_value < initial_metric_value:
         sys.stdout.flush()
-        return affine_transform_to_matrix(transform)
+        return ut.affine_transform_to_matrix(transform)
     else:
         print("Optimization failed to improve metric")
         print("Returning default")
@@ -345,18 +272,6 @@ def piecewise_affine_align(
             chunks=[1,1,1,4,4],
         ).compute()
 
-        # adjust affines for block origins
-        for i in range(np.prod(nblocks)):
-            x, y, z = np.unravel_index(i, nblocks)
-            origin = np.maximum(
-                np.array(blocksize) * [x, y, z] - overlaps, 0,
-            )
-            origin = origin * fix_spacing
-            tl, tr = np.eye(4), np.eye(4)
-            tl[:3, -1], tr[:3, -1] = origin, -origin
-            a = affines[x, y, z]
-            affines[x, y, z] = np.matmul(tl, np.matmul(a, tr))
-
         # stitch local affines into displacement field
         field = stitch.local_affine_to_displacement(
             fix.shape, fix_spacing, affines, blocksize,
@@ -382,8 +297,8 @@ def exhaustive_translation(
     mov = mov.squeeze()
 
     # convert to sitk images
-    fix_itk = numpy_to_sitk(fix, fix_spacing, origin=fix_origin)
-    mov_itk = numpy_to_sitk(mov, mov_spacing, origin=mov_origin)
+    fix_itk = ut.numpy_to_sitk(fix, fix_spacing, origin=fix_origin)
+    mov_itk = ut.numpy_to_sitk(mov, mov_spacing, origin=mov_origin)
 
     # define callback: keep track of alignment scores
     scores = np.zeros(tuple(2*x+1 for x in num_steps[::-1]), dtype=np.float32)
@@ -643,8 +558,8 @@ def apply_transform(
 
     # convert images to sitk objects
     dtype = fix.dtype
-    fix = numpy_to_sitk(fix, fix_spacing, fix_origin)
-    mov = numpy_to_sitk(mov, mov_spacing, mov_origin)
+    fix = ut.numpy_to_sitk(fix, fix_spacing, fix_origin)
+    mov = ut.numpy_to_sitk(mov, mov_spacing, mov_origin)
 
     # default transform spacing is fixed voxel spacing 
     if transform_spacing is None:
@@ -654,9 +569,9 @@ def apply_transform(
     transform = sitk.CompositeTransform(3)
     for t in transform_list:
         if len(t.shape) == 2:
-            t = matrix_to_affine_transform(t)
+            t = ut.matrix_to_affine_transform(t)
         elif len(t.shape) == 4:
-            t = field_to_displacement_field_transform(t, transform_spacing)
+            t = ut.field_to_displacement_field_transform(t, transform_spacing)
         transform.AddTransform(t)
 
     # set up resampler object
