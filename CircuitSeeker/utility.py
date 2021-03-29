@@ -55,6 +55,38 @@ def matrix_to_affine_transform(matrix):
     return transform
 
 
+def matrix_to_euler_transform(matrix):
+    """
+    """
+
+    matrix_sitk = invert_matrix_axes(matrix)
+    transform = sitk.Euler3DTransform()
+    transform.SetMatrix(matrix_sitk[:3, :3].flatten())
+    transform.SetTranslation(matrix_sitk[:3, -1].squeeze())
+    return transform
+
+
+def euler_transform_to_parameters(transform):
+    """
+    """
+
+    return np.array((transform.GetAngleX(),
+                     transform.GetAngleY(),
+                     transform.GetAngleZ()) +
+                     transform.GetTranslation()
+    )
+
+
+def parameters_to_euler_transform(params):
+    """
+    """
+
+    transform = sitk.Euler3DTransform()
+    transform.SetRotation(*params[:3])
+    transform.SetTranslation(params[3:])
+    return transform
+
+
 def matrix_to_displacement_field(reference, matrix, spacing):
     """
     """

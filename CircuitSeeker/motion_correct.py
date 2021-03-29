@@ -1,153 +1,59 @@
-from glob import glob
 import numpy as np
 import os
-
 import ClusterWrap
 import CircuitSeeker.fileio as csio
+import CircuitSeeker.utility as ut
+from CircuitSeeker.align import affine_align
+from CircuitSeeker.transform import apply_transform
 import dask.array as da
-import dask.bag as db
 import dask.delayed as delayed
-
-import SimpleITK as sitk
-from scipy.ndimage import median_filter, gaussian_filter1d
+from scipy.ndimage import median_filter
+from scipy.ndimage import gaussian_filter1d
+from scipy.ndimage import map_coordinates
+from scipy.ndimage import zoom
 import zarr
 from numcodecs import Blosc
+from pathlib import Path
+from glob import glob
 
 
-def ensureArray(reference, dataset_path):
-    """
-    """
-
-    if not isinstance(reference, np.ndarray):
-        if not isinstance(reference, str):
-            raise ValueError("image references must be ndarrays or filepaths")
-        reference = csio.readImage(reference, dataset_path)[...]  # hdf5 arrays are lazy
-    return reference
-
-
-def rigidAlign(
-    fixed, moving,
-    fixed_vox, moving_vox,
-    dataset_path=None,
-    metric_sample_percentage=0.1,
-    shrink_factors=[2,1],
-    smooth_sigmas=[1,0],
-    minStep=0.1,
-    learningRate=1.0,
-    numberOfIterations=50,
-    target_spacing=2.0,
+def distributed_image_mean(
+    frames,
+    cluster_kwargs={},
 ):
     """
     """
 
-    # get moving/fixed images as ndarrays
-    fixed = ensureArray(fixed, dataset_path)
-    moving = ensureArray(moving, dataset_path)
+    with ClusterWrap.cluster(**cluster_kwargs) as cluster:
 
-    # determine skip sample factors
-    fss = np.maximum(np.round(target_spacing / fixed_vox), 1).astype(np.int)
-    mss = np.maximum(np.round(target_spacing / moving_vox), 1).astype(np.int)
+        # hdf5 files use dask.array
+        if csio.testPathExtensionForHDF5(frames['suffix']):
+            frames = csio.daskArrayBackedByHDF5(
+                frames['folder'], frames['prefix'],
+                frames['suffix'], frames['dataset_path'],
+            )
+            cluster.scale_cluster(frames.shape[0] + 1)
+            frames_mean = frames.mean(axis=0, dtype=np.float32).compute()
+            frames_mean = np.round(frames_mean).astype(frames[0].dtype)
+        # other types use dask.bag
+        else:
+            frames = csio.daskBagOfFilePaths(
+                frames['folder'], frames['prefix'], frames['suffix'],
+            )
+            nframes = frames.npartitions
+            cluster.scale_cluster(frames.npartitions + 1)
+            frames_mean = frames.map(csio.readImage).reduction(sum, sum).compute()
+            dtype = frames_mean.dtype
+            frames_mean = np.round(frames_mean/np.float(nframes)).astype(dtype)
 
-    # skip sample the images
-    fixed = fixed[::fss[0], ::fss[1], ::fss[2]]
-    moving = moving[::mss[0], ::mss[1], ::mss[2]]
-    fixed_vox = fixed_vox * fss
-    moving_vox = moving_vox * mss
-
-    # convert to sitk images, set spacing
-    fixed = sitk.GetImageFromArray(fixed)
-    moving = sitk.GetImageFromArray(moving)
-    fixed.SetSpacing(fixed_vox[::-1])  # numpy z,y,x --> itk x,y,z
-    moving.SetSpacing(moving_vox[::-1])
-
-    # set up registration object
-    irm = sitk.ImageRegistrationMethod()
-    ncores = int(os.environ["LSB_DJOB_NUMPROC"])  # LSF specific!
-    irm.SetNumberOfThreads(2*ncores)
-    irm.SetInterpolator(sitk.sitkLinear)
-
-    # metric, built for speed
-    irm.SetMetricAsMeanSquares()
-    irm.SetMetricSamplingStrategy(irm.RANDOM)
-    irm.SetMetricSamplingPercentage(metric_sample_percentage)
-
-    # optimizer, built for simplicity
-    max_step = np.min(fixed_vox)
-    irm.SetOptimizerAsRegularStepGradientDescent(
-        minStep=minStep, learningRate=learningRate,
-        numberOfIterations=numberOfIterations,
-        maximumStepSizeInPhysicalUnits=max_step
-    )
-    irm.SetOptimizerScalesFromPhysicalShift()
-
-    # pyramid
-    irm.SetShrinkFactorsPerLevel(shrinkFactors=shrink_factors)
-    irm.SetSmoothingSigmasPerLevel(smoothingSigmas=smooth_sigmas)
-    irm.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
-
-    # initialize
-    irm.SetInitialTransform(sitk.Euler3DTransform())
-
-    # execute, convert to numpy and return
-    transform = irm.Execute(sitk.Cast(fixed, sitk.sitkFloat32),
-                            sitk.Cast(moving, sitk.sitkFloat32),
-    )
-    return transform.GetParameters()
+    # return reference to mean image
+    return frames_mean
 
 
-def applyTransform(
-    moving,
-    moving_vox,
-    params,
-    dataset_path=None):
-    """
-    """
-
-    # get the moving image as a numpy array
-    moving = ensureArray(moving, dataset_path)
-
-    # use sitk transform and interpolation to apply transform
-    moving = sitk.GetImageFromArray(moving)
-    moving.SetSpacing(moving_vox[::-1])  # numpy z,y,x --> itk x,y,z
-    transform = _parametersToEuler3DTransform(params)
-    transformed = sitk.Resample(moving, moving, transform,
-        sitk.sitkLinear, 0.0, moving.GetPixelID()
-    )
-    # return as numpy array
-    return sitk.GetArrayFromImage(transformed)
-
-
-# useful format conversions for rigid transforms
-def _euler3DTransformToParameters(euler):
-    """
-    """
-    return np.array(( euler.GetAngleX(),
-                      euler.GetAngleY(),
-                      euler.GetAngleZ() ) +
-                      euler.GetTranslation()
-                   )
-def _parametersToEuler3DTransform(params):
-    """
-    """
-    transform = sitk.Euler3DTransform()
-    transform.SetRotation(*params[:3])
-    transform.SetTranslation(params[3:])
-    return transform
-def _parametersToRigidMatrix(params):
-    """
-    """
-    transform = _parametersToEuler3DTransform(params)
-    matrix = np.eye(4)
-    matrix[:3, :3] = np.array(transform.GetMatrix()).reshape((3,3))
-    matrix[:3, -1] = np.array(transform.GetTranslation())
-    return matrix
-
-
-# TODO: refactor motionCorrect
-def motionCorrect(
-    fixed, frames,
-    fixed_spacing, frames_spacing,
-    write_path,
+def motion_correct(
+    fix, frames,
+    fix_spacing, frames_spacing,
+    time_stride=1,
     sigma=7,
     cluster_kwargs={},
     **kwargs,
@@ -157,112 +63,176 @@ def motionCorrect(
 
     with ClusterWrap.cluster(**cluster_kwargs) as cluster:
 
-        # writing large compressed chunks locks GIL for a long time
-        cluster.modify_dask_config(
-            {'distributed.comm.timeouts.connect':'60s',
-             'distributed.comm.timeouts.tcp':'180s',}
-        )
+        # wrap fixed data as delayed object
+        fix_d = delayed(fix)
 
         # create dask array of all frames
         frames_data = csio.daskArrayBackedByHDF5(
             frames['folder'], frames['prefix'],
             frames['suffix'], frames['dataset_path'],
         )
-        nframes = frames.shape[0]
+        total_frames = frames_data.shape[0]
 
-        # scale cluster carefully
-        max_workers = 1250
-        if 'max_workers' in kwargs.keys():
-            max_workers = kwargs['max_workers']
-        cluster.scale_cluster(min(nframes, max_workers))
+        # slice in time
+        frames_data = frames_data[::time_stride]
+        compute_frames = frames_data.shape[0]
+
+        # scale the cluster
+        cluster.scale_cluster(compute_frames + 1)
+
+        # set alignment defaults
+        alignment_defaults = {
+            'alignment_spacing':2.0,
+            'metric':'MS',
+            'sampling':'random',
+            'sampling_percentage':0.1,
+            'optimizer':'RGD',
+            'iterations':50,
+            'max_step':2.0,
+        }
+        for k, v in alignment_defaults.items():
+            if k not in kwargs:
+                kwargs[k] = v
  
-        # align all
-        
-    
-        # (weak) outlier removal and smoothing
-        params = median_filter(params, footprint=np.ones((3,1)))
-        params = gaussian_filter1d(params, sigma, axis=0)
-    
-        # write transforms as matrices
-        if transforms_dir is not None:
-            paths = list(frames)
-            for ind, p in enumerate(params):
-                transform = _parametersToRigidMatrix(p)
-                basename = os.path.splitext(os.path.basename(paths[ind]))[0]
-                path = os.path.join(transforms_dir, basename) + '_rigid.mat'
-                np.savetxt(path, transform)
-    
-        # apply transforms to all images
-        params = db.from_sequence(params, npartitions=nframes)
-        transformed = frames.map(lambda b,x,y,z: applyTransform(b,x,y, dataset_path=z),
-            x=dmoving_vox, y=params, z=ddataset_path,
-        ).to_delayed()
-    
-        # convert to a (lazy) 4D dask array
-        sh = transformed[0][0].shape.compute()
-        dd = transformed[0][0].dtype.compute()
-        arrays = [da.from_delayed(t[0], sh, dtype=dd) for t in transformed]
-        transformed = da.stack(arrays, axis=0)
-    
-        # write in parallel as 4D array to zarr file
-        compressor = Blosc(cname='zstd', clevel=9, shuffle=Blosc.BITSHUFFLE)
-        transformed_disk = zarr.open(write_path, 'w',
-            shape=transformed.shape, chunks=(256, 10, 256, 256),
-            dtype=transformed.dtype, compressor=compressor
-        )
-        da.to_zarr(transformed, transformed_disk)
-    
-        # return reference to data on disk
-        return transformed_disk
+        # wrap align function
+        def wrapped_affine_align(mov, fix_d):
+            mov = mov.squeeze()
+            t = affine_align(
+                fix_d, mov, fix_spacing, frames_spacing,
+                **kwargs,
+            )
+            e = ut.matrix_to_euler_transform(t)
+            p = ut.euler_transform_to_parameters(e)
+            return p[None, :]
+
+        params = da.map_blocks(
+            wrapped_affine_align, frames_data,
+            fix_d=fix_d,
+            dtype=np.float64,
+            drop_axis=[2, 3,],
+            chunks=[1, 6],
+        ).compute()
+
+    # (weak) outlier removal and smoothing
+    params = median_filter(params, footprint=np.ones((3,1)))
+    params = gaussian_filter1d(params, sigma, axis=0)
+
+    # interpolate
+    if time_stride > 1:
+        x = np.linspace(0, compute_frames-1, total_frames)
+        coords = np.meshgrid(x, np.mgrid[:6], indexing='ij')
+        params = map_coordinates(params, coords)
+
+    # convert to matrices
+    transforms = np.empty((total_frames, 4, 4))
+    for i in range(params.shape[0]):
+        e = ut.parameters_to_euler_transform(params[i])
+        t = ut.affine_transform_to_matrix(e)
+        transforms[i] = t
+
+    # return all transforms
+    return transforms
 
 
-def distributedImageMean(
-    folder, prefix, suffix, dataset_path=None,
-    distributed_state=None, write_path=None,
+def save_transforms(transforms, folder, prefix='rigid_transform'):
+    """
+    """
+
+    Path(folder).mkdir(parents=True, exist_ok=True)
+    for i in range(transforms.shape[0]):
+        basename = prefix + f'_frame_{i:08d}.mat'
+        path = os.path.join(folder, basename)
+        np.savetxt(path, transforms[i])
+
+
+def read_transforms(folder, prefix='rigid_transform'):
+    """
+    """
+
+    tp = sorted(glob(folder + '/' + prefix + "*"))
+    transforms = np.empty( (len(tp),) + (4,4) )
+    for i in range(transforms.shape[0]):
+        transforms[i] = np.loadtxt(tp[i])
+    return transforms
+
+
+def resample_frames(
+    fix, frames,
+    fix_spacing, frames_spacing,
+    transforms,
+    write_path,
+    mask=None,
+    subset=None,
+    cluster_kwargs={},
 ):
     """
-    Returns mean over images matching `folder/prefix*suffix`
-    If images are hdf5 you must specify `dataset_path`
-    To additionally write the mean image to disk, specify `write_path`
-    Computations are distributed, to supply your own dask scheduler and cluster set
-        `distributed_state` to an existing `CircuitSeeker.distribued.distributedState` object
-        otherwise a new cluster will be created
     """
 
-    # set up the distributed environment
-    ds = distributed_state
-    if distributed_state is None:
-        ds = csd.distributedState()
-        ds.initializeLSFCluster(job_extra=["-P scicompsoft"])
-        ds.initializeClient()
+    with ClusterWrap.cluster(**cluster_kwargs) as cluster:
 
-    # hdf5 files use dask.array
-    if csio.testPathExtensionForHDF5(suffix):
-        frames = csio.daskArrayBackedByHDF5(folder, prefix, suffix, dataset_path)
-        nframes = frames.shape[0]
-        ds.scaleCluster(njobs=nframes)
-        frames_mean = frames.mean(axis=0).compute()
-        frames_mean = np.round(frames_mean).astype(frames[0].dtype)
-    # other types use dask.bag
-    else:
-        frames = csio.daskBagOfFilePaths(folder, prefix, suffix)
-        nframes = frames.npartitions
-        ds.scaleCluster(njobs=nframes)
-        frames_mean = frames.map(csio.readImage).reduction(sum, sum).compute()
-        dtype = frames_mean.dtype
-        frames_mean = np.round(frames_mean/np.float(nframes)).astype(dtype)
+        # wrap fixed data as delayed object
+        fix_d = delayed(fix)
 
-    # release resources
-    if distributed_state is None:
-        ds.closeClient()
+        # wrap mask
+        mask_d = delayed(mask) if mask is not None else None
 
-    # write result
-    if write_path is not None:
-        if csio.testPathExtensionForHDF5(write_path):
-            csio.writeHDF5(write_path, dataset_path, frames_mean)
-        else:
-            csio.writeImage(write_path, frames_mean)
+        # slice subset of transforms
+        if subset is not None:
+            transforms = transforms[subset]
 
-    # return reference to mean image
-    return frames_mean
+        # wrap transforms as dask array
+        # extra dimension to match frames_data ndims
+        transforms = transforms[:, None, :, :]
+        transforms_d = da.from_array(transforms, chunks=(1, 1, 4, 4))
+
+        # create dask array of all frames
+        frames_data = csio.daskArrayBackedByHDF5(
+            frames['folder'], frames['prefix'],
+            frames['suffix'], frames['dataset_path'],
+        )
+
+        # slice subset of data
+        if subset is not None:
+            frames_data = frames_data[subset]
+        total_frames = frames_data.shape[0]
+
+        # scale cluster
+        cluster.scale_cluster(total_frames + 1)
+
+        # wrap transform function
+        def wrapped_apply_transform(mov, t, fix_d, mask_d=None):
+            mov = mov.squeeze()
+            t = t.squeeze()
+            aligned = apply_transform(
+                fix_d, mov, fix_spacing, frames_spacing,
+                transform_list=[t,],
+            )
+            if mask_d is not None:
+                aligned = aligned * mask_d
+            aligned = zoom(
+                aligned, np.array(mov.shape) / aligned.shape, order=1,
+            )
+            return aligned[None, ...]
+
+        # apply transform to all frames
+        frames_aligned = da.map_blocks(
+            wrapped_apply_transform, frames_data, transforms_d,
+            fix_d=fix_d,
+            mask_d=mask_d,
+            dtype=np.uint16,
+            chunks=[1,] + list(frames_data[0].shape),
+        )
+
+        # write in parallel as 4D array to zarr file
+        compressor = Blosc(cname='zstd', clevel=9, shuffle=Blosc.BITSHUFFLE)
+        aligned_disk = zarr.open(write_path, 'w',
+            shape=frames_aligned.shape,
+            chunks=[1,] + list(frames_data[0].shape),
+            dtype=frames_aligned.dtype,
+            compressor=compressor
+        )
+        da.to_zarr(frames_aligned, aligned_disk)
+
+        # return reference to zarr store
+        return aligned_disk
 

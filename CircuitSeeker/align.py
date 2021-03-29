@@ -13,7 +13,7 @@ def configure_irm(
     metric='MI', bins=128,
     sampling='regular', sampling_percentage=1.0,
     optimizer='GD', iterations=200, learning_rate=1.0,
-    min_step=1.0, max_step=1.0,
+    min_step=0.1, max_step=1.0,
     shrink_factors=[2,1],
     smooth_sigmas=[2,1],
     num_steps=[2, 2, 2],
@@ -306,12 +306,11 @@ def exhaustive_translation(
         iteration = irm.GetOptimizerIteration()
         indx = np.unravel_index(iteration, scores.shape, order='F')
         scores[indx[0], indx[1], indx[2]] = irm.GetMetricValue()
-    irm.AddCommand(sitk.sitkIterationEvent, lambda: callback(irm))
 
     # get irm
     kwargs['optimizer'] = 'EX'
     kwargs['num_steps'] = num_steps
-    kwargs['step_sizes'] = step_sizes
+    kwargs['step_sizes'] = step_sizes * fix_spacing
     kwargs['callback'] = callback
     irm = configure_irm(**kwargs)
 
@@ -336,108 +335,111 @@ def exhaustive_translation(
     # determine if minimum is good enough
     trans = np.zeros(3)
     if min1 <= min2*peak_ratio:
-        trans = (np.array(min1_indx) - num_steps[::-1]) * step_sizes[::-1]
+        trans = np.array(min1_indx[::-1]) - num_steps
+        trans = trans * step_sizes * fix_spacing
 
     # return translation in xyz order
     return trans[::-1]
 
 
 def piecewise_exhaustive_translation(
-    fixed, moving, mask,
-    fixed_vox, moving_vox,
-    query_radius,
-    search_radius,
+    fix, mov,
+    fix_spacing, mov_spacing,
     stride,
+    query_radius,
+    num_steps,
     step_sizes,
     smooth_sigma,
+    mask=None,
     nworkers=100,
+    cluster_kwargs={},
     **kwargs,
     ):
     """
     """
 
+    # compute search radius in voxels
+    search_radius = [q+x*y for q, x, y in zip(query_radius, num_steps, step_sizes)]
+
+    # compute edge pad size
+    limit = [x if x > y else y for x, y in zip(search_radius, stride)]
+
+    # get valid sample points as coordinates
+    samples = np.zeros_like(fix)
+    samples[limit[0]:-limit[0]:stride[0],
+            limit[1]:-limit[1]:stride[1],
+            limit[2]:-limit[2]:stride[2]] = 1
+    if mask is not None:
+        samples = samples * mask
+    samples = np.nonzero(samples)
+
+    # prepare arrays to hold fixed and moving blocks
+    nsamples = len(samples[0])
+    fix_blocks_shape = (nsamples,) + tuple(x*2 for x in search_radius)
+    mov_blocks_shape = (nsamples,) + tuple(x*2 for x in query_radius)
+    fix_blocks = np.empty(fix_blocks_shape, dtype=fix.dtype)
+    mov_blocks = np.empty(mov_blocks_shape, dtype=mov.dtype)
+
+    # get context for all sample points
+    for i, (x, y, z) in enumerate(zip(samples[0], samples[1], samples[2])):
+        fix_blocks[i] = fix[x-search_radius[0]:x+search_radius[0],
+                            y-search_radius[1]:y+search_radius[1],
+                            z-search_radius[2]:z+search_radius[2]]
+        mov_blocks[i] = mov[x-query_radius[0]:x+query_radius[0],
+                            y-query_radius[1]:y+query_radius[1],
+                            z-query_radius[2]:z+query_radius[2]]
+
+    # compute the query_block origin in physical units
+    mov_origin = np.array(search_radius) - query_radius
+    mov_origin = mov_origin * fix_spacing
+
     # set up cluster
-    with csd.distributedState() as ds:
-
-        # TODO: expose cores/tpw, remove job_extra -P
-        ds.initializeLSFCluster(project="ahrens", walltime="4:00")
-        ds.initializeClient()
-        ds.scaleCluster(njobs=nworkers)
-
-        # get valid sample points as coordinates
-        samples = np.zeros_like(fixed)
-        samples[search_radius[0]:-search_radius[0]:stride[0],
-                search_radius[1]:-search_radius[1]:stride[1],
-                search_radius[2]:-search_radius[2]:stride[2]] = 1
-        samples = np.nonzero(samples * mask)
-
-        # prepare arrays to hold fixed and moving blocks
-        nsamples = len(samples[0])
-        fixed_blocks_shape = (nsamples,) + tuple(x*2 for x in search_radius)
-        moving_blocks_shape = (nsamples,) + tuple(x*2 for x in query_radius)
-        fixed_blocks = np.empty(fixed_blocks_shape, dtype=fixed.dtype)
-        moving_blocks = np.empty(moving_blocks_shape, dtype=moving.dtype)
-
-        # get context for all sample points
-        for i, (x, y, z) in enumerate(zip(samples[0], samples[1], samples[2])):
-            fixed_blocks[i] = fixed[x-search_radius[0]:x+search_radius[0],
-                                    y-search_radius[1]:y+search_radius[1],
-                                    z-search_radius[2]:z+search_radius[2]]
-            moving_blocks[i] = moving[x-query_radius[0]:x+query_radius[0],
-                                      y-query_radius[1]:y+query_radius[1],
-                                      z-query_radius[2]:z+query_radius[2]]
+    with ClusterWrap.cluster(**cluster_kwargs) as cluster:
+        cluster.scale_cluster(nworkers)
 
         # convert to dask arrays
-        fixed_blocks_da = da.from_array(
-            fixed_blocks, chunks=(1,)+fixed_blocks.shape[1:],
+        fix_blocks_da = da.from_array(
+            fix_blocks, chunks=(1,)+fix_blocks.shape[1:],
         )
-        moving_blocks_da = da.from_array(
-            moving_blocks, chunks=(1,)+moving_blocks.shape[1:],
+        mov_blocks_da = da.from_array(
+            mov_blocks, chunks=(1,)+mov_blocks.shape[1:],
         )
-
-        # compute the query_block origin
-        moving_origin = np.array(search_radius) - query_radius
-        moving_origin = moving_origin * fixed_vox
-
-        # compute the number of steps needed
-        num_steps = np.ceil(moving_origin/step_sizes)
-        num_steps = [int(x) for x in num_steps]
 
         # closure for exhaustive translation alignment
-        def my_exhaustive_translation(x, y):
-            t = exhaustiveTranslation(
-                x, y, fixed_vox, moving_vox,
+        def wrapped_exhaustive_translation(x, y):
+            t = exhaustive_translation(
+                x, y, fix_spacing, mov_spacing,
                 num_steps, step_sizes,
-                moving_origin=moving_origin,
+                mov_origin=mov_origin,
                 **kwargs,
             )
             return np.array(t).reshape((1, 3))
 
         # distribute
         translations = da.map_blocks(
-            my_exhaustive_translation,
-            fixed_blocks_da, moving_blocks_da,
+            wrapped_exhaustive_translation,
+            fix_blocks_da, mov_blocks_da,
             dtype=np.float64, 
             drop_axis=[2,3],
             chunks=[1, 3],
         ).compute()
 
-        # reformat to displacement vector field
-        dvf = np.zeros(fixed.shape + (3,), dtype=np.float32)
-        weights = np.pad([[[1.]]], [(s, s) for s in stride], mode='linear_ramp')
-        for t, x, y, z in zip(translations, samples[0], samples[1], samples[2]):
-            s = [slice(max(0, x-stride[0]), x+stride[0]+1),
-                 slice(max(0, y-stride[1]), y+stride[1]+1),
-                 slice(max(0, z-stride[2]), z+stride[2]+1),]
-            dvf[tuple(s)] += t * weights[..., None]
+    # reformat to displacement vector field
+    dvf = np.zeros(fix.shape + (3,), dtype=np.float32)
+    weights = np.pad([[[1.]]], [(s, s) for s in stride], mode='linear_ramp')
+    for t, x, y, z in zip(translations, samples[0], samples[1], samples[2]):
+        s = [slice(max(0, x-stride[0]), x+stride[0]+1),
+             slice(max(0, y-stride[1]), y+stride[1]+1),
+             slice(max(0, z-stride[2]), z+stride[2]+1),]
+        dvf[tuple(s)] += t * weights[..., None]
 
-        # smooth
-        dvf_s = np.empty_like(dvf)
-        for i in range(3):
-            dvf_s[..., i] = gaussian_filter(dvf[..., i], smooth_sigma/fixed_vox)
+    # smooth
+    dvf_s = np.empty_like(dvf)
+    for i in range(3):
+        dvf_s[..., i] = gaussian_filter(dvf[..., i], smooth_sigma/fix_spacing)
 
-        # return
-        return dvf_s
+    # return
+    return dvf_s
 
 
 
