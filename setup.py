@@ -25,5 +25,6 @@ setuptools.setup(
         'numcodecs',
         'morphsnakes',
         'ClusterWrap',
+        'pynrrd',
     ]
 )
