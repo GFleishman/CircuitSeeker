@@ -3,6 +3,7 @@ import h5py
 from glob import glob
 from os import path
 import numpy as np
+import ClusterWrap
 
 import dask.bag as db
 import dask.array as da
@@ -124,4 +125,30 @@ def ensureArray(reference, dataset_path):
             raise ValueError("image references must be ndarrays or filepaths")
         reference = readImage(reference, dataset_path)[...]  # hdf5 arrays are lazy
     return reference
+
+
+def stack_to_hdf5(stack_path, write_path, dims, dtype):
+    """
+    """
+
+    stack = np.fromfile(stack_path, dtype=dtype).reshape(dims)
+    writeHDF5(write_path, '/default', stack)
+
+
+def distributed_stack_to_hdf5(
+    folder, prefix, suffix,
+    dims, dtype,
+    cluster_kwargs={}
+):
+    """
+    """
+
+    stack_paths = globPaths(folder, prefix, suffix)
+    write_paths = [path.splitext(s)[0] + '.h5' for s in stack_paths]
+    nimages = len(stack_paths)
+    stack_paths_b = db.from_sequence(stack_paths, npartitions=nimages)
+    write_paths_b = db.from_sequence(write_paths, npartitions=nimages)
+    with ClusterWrap.cluster(**cluster_kwargs) as cluster:
+        cluster.scale_cluster(nimages + 1)
+        stack_paths_b.map(stack_to_hdf5, write_paths_b, dims, dtype).compute()
 
