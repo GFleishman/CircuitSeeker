@@ -11,8 +11,8 @@ def estimate_background(image, rad=5):
     """
 
     a, b = slice(0, rad), slice(-rad, None)
-    corners = [[a,a,a], [a,a,b], [a,b,a], [a,b,b],
-               [b,a,a], [b,a,b], [b,b,a], [b,b,b]]
+    corners = ((a,a,a), (a,a,b), (a,b,a), (a,b,b),
+               (b,a,a), (b,a,b), (b,b,a), (b,b,b))
     return np.median([np.mean(image[c]) for c in corners])
 
 
@@ -32,7 +32,7 @@ def segment(
     if init is None:
         init = np.zeros_like(image, dtype=np.uint8)
         bounds = np.ceil(np.array(image.shape) * 0.1).astype(int)
-        init[[slice(b, -b) for b in bounds]] = 1
+        init[tuple(slice(b, -b) for b in bounds)] = 1
     return morphsnakes.morphological_chan_vese(
         image,
         iterations,
