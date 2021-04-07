@@ -82,6 +82,7 @@ def motion_correct(
 
         # set alignment defaults
         alignment_defaults = {
+            'rigid':True,
             'alignment_spacing':2.0,
             'metric':'MS',
             'sampling':'random',
@@ -157,12 +158,13 @@ def read_transforms(folder, prefix='rigid_transform'):
 
 
 def resample_frames(
-    fix, frames,
-    fix_spacing, frames_spacing,
+    frames,
+    frames_spacing,
     transforms,
     write_path,
     mask=None,
     subset=None,
+    compression_level=4,
     cluster_kwargs={},
 ):
     """
@@ -170,29 +172,28 @@ def resample_frames(
 
     with ClusterWrap.cluster(**cluster_kwargs) as cluster:
 
-        # wrap fixed data as delayed object
-        fix_d = delayed(fix)
-
-        # wrap mask
-        mask_d = delayed(mask) if mask is not None else None
-
-        # slice subset of transforms
-        if subset is not None:
-            transforms = transforms[subset]
-
-        # wrap transforms as dask array
-        # extra dimension to match frames_data ndims
-        transforms = transforms[:, None, :, :]
-        transforms_d = da.from_array(transforms, chunks=(1, 1, 4, 4))
-
         # create dask array of all frames
         frames_data = csio.daskArrayBackedByHDF5(
             frames['folder'], frames['prefix'],
             frames['suffix'], frames['dataset_path'],
         )
 
-        # slice subset of data
+        # wrap transforms as dask array
+        # extra dimension to match frames_data ndims
+        transforms = transforms[:, None, :, :]
+        transforms_d = da.from_array(transforms, chunks=(1, 1, 4, 4))
+
+        # wrap mask
+        mask_d = None
+        if mask is not None:
+            mask_sh, frame_sh = mask.shape, frames_data.shape[1:]
+            if mask_sh != frame_sh:
+                mask = zoom(mask, np.array(frame_sh) / mask_sh, order=0)
+            mask_d = delayed(mask)
+
+        # slice subset
         if subset is not None:
+            transforms = transforms[subset]
             frames_data = frames_data[subset]
         total_frames = frames_data.shape[0]
 
@@ -200,34 +201,35 @@ def resample_frames(
         cluster.scale_cluster(total_frames + 1)
 
         # wrap transform function
-        def wrapped_apply_transform(mov, t, fix_d, mask_d=None):
+        def wrapped_apply_transform(mov, t, mask_d=None):
             mov = mov.squeeze()
             t = t.squeeze()
             aligned = apply_transform(
-                fix_d, mov, fix_spacing, frames_spacing,
+                mov, mov, frames_spacing, frames_spacing,
                 transform_list=[t,],
             )
             if mask_d is not None:
                 aligned = aligned * mask_d
-            aligned = zoom(
-                aligned, np.array(mov.shape) / aligned.shape, order=1,
-            )
             return aligned[None, ...]
 
         # apply transform to all frames
         frames_aligned = da.map_blocks(
             wrapped_apply_transform, frames_data, transforms_d,
-            fix_d=fix_d,
             mask_d=mask_d,
             dtype=np.uint16,
-            chunks=[1,] + list(frames_data[0].shape),
+            chunks=[1,] + list(frames_data.shape[1:]),
         )
 
         # write in parallel as 4D array to zarr file
-        compressor = Blosc(cname='zstd', clevel=9, shuffle=Blosc.BITSHUFFLE)
-        aligned_disk = zarr.open(write_path, 'w',
+        compressor = Blosc(
+            cname='zstd',
+            clevel=compression_level,
+            shuffle=Blosc.BITSHUFFLE,
+        )
+        aligned_disk = zarr.open(
+            write_path, 'w',
             shape=frames_aligned.shape,
-            chunks=[1,] + list(frames_data[0].shape),
+            chunks=[1,] + list(frames_data.shape[1:]),
             dtype=frames_aligned.dtype,
             compressor=compressor
         )

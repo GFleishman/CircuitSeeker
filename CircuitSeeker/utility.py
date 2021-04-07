@@ -102,8 +102,20 @@ def field_to_displacement_field_transform(field, spacing):
     """
     """
 
-    field = field.astype(np.float64)
+    field = field.astype(np.float64)[..., ::-1]
     transform = numpy_to_sitk(field, spacing, vector=True)
     return sitk.DisplacementFieldTransform(transform)
+
+
+def bspline_to_displacement_field(reference, bspline):
+    """
+    """
+
+    df = sitk.TransformToDisplacementField(
+        bspline, sitk.sitkVectorFloat64,
+        reference.GetSize(), reference.GetOrigin(),
+        reference.GetSpacing(), reference.GetDirection(),
+    )
+    return sitk.GetArrayFromImage(df).astype(np.float32)
 
 
