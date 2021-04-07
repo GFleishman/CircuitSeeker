@@ -88,7 +88,9 @@ def configure_irm(
 def affine_align(
     fix, mov,
     fix_spacing, mov_spacing,
-    rigid=True,
+    rigid=False,
+    initial_transform=None,
+    initialize_with_centering=False,
     alignment_spacing=None,
     fix_mask=None,
     mov_mask=None,
@@ -101,8 +103,8 @@ def affine_align(
     """
 
     # update default if rigid is provided
-    if isinstance(rigid, np.ndarray) and np.all(default == np.eye(4)):
-        default = rigid
+    if initial_transform is not None and np.all(default == np.eye(4)):
+        default = initial_transform
 
     # if using masks, ensure there is sufficient foreground
     FOREGROUND_PERCENTAGE_THRESHOLD = 0.2
@@ -139,13 +141,23 @@ def affine_align(
     # set up registration object
     irm = configure_irm(**kwargs)
 
-    # set initial transform
-    if isinstance(rigid, np.ndarray):
-        transform = ut.matrix_to_affine_transform(rigid)
-    elif not rigid:
-        transform = sitk.AffineTransform(3)
-    else:
+    # select initial transform type
+    if rigid and initial_transform is None:
         transform = sitk.Euler3DTransform()
+    elif rigid and initial_transform is not None:
+        transform = ut.matrix_to_euler_transform(initial_transform)
+    elif not rigid and initial_transform is None:
+        transform = sitk.AffineTransform(3)
+    elif not rigid and initial_transform is not None:
+        transform = ut.matrix_to_affine_transform(initial_transform)
+
+    # consider initializing with centering
+    if initial_transform is None and initialize_with_centering:
+        transform = sitk.CenteredTransformInitializer(
+            fix, mov, transform,
+        )
+
+    # set initial transform
     irm.SetInitialTransform(transform, inPlace=True)
 
     # set masks
@@ -161,6 +173,10 @@ def affine_align(
         sitk.Cast(fix, sitk.sitkFloat32),
         sitk.Cast(mov, sitk.sitkFloat32),
     )
+
+    # if centered, convert back to Euler3DTransform object
+    if not isinstance(rigid, np.ndarray) and initialize_with_centering:
+        transform = sitk.Euler3DTransform(transform)
 
     # get initial and final metric values
     initial_metric_value = irm.MetricEvaluate(
@@ -449,7 +465,7 @@ def piecewise_exhaustive_translation(
 
 # TODO: still need to refactor deformable
 
-def deformable_align(
+def deformable_align_greedypy(
     fixed, moving,
     fixed_vox, moving_vox,
     radius=32,
@@ -479,7 +495,7 @@ def deformable_align(
     return register.get_warp()
 
 
-def piecewise_deformable_align(
+def piecewise_deformable_align_greedypy(
     fixed, moving,
     fixed_vox, moving_vox,
     affine_matrix,
@@ -553,4 +569,77 @@ def piecewise_deformable_align(
 
     return deformation, resampled
 
+
+def deformable_align(
+    fix, mov,
+    fix_spacing, mov_spacing,
+    control_point_spacing,
+    control_point_levels,
+    initial_transform=None,
+    fix_mask=None,
+    mov_mask=None,
+    fix_origin=None,
+    mov_origin=None,
+    **kwargs,
+):
+    """
+    """
+
+    # convert to sitk images
+    fix = ut.numpy_to_sitk(fix, fix_spacing, origin=fix_origin)
+    mov = ut.numpy_to_sitk(mov, mov_spacing, origin=mov_origin)
+
+    # set up registration object
+    irm = configure_irm(**kwargs)
+
+    # set initial moving transform
+    if initial_transform is not None:
+        if len(initial_transform.shape) == 2:
+            it = ut.matrix_to_affine_transform(initial_transform)
+        irm.SetMovingInitialTransform(it)
+
+    # get control point grid shape
+    fix_size_physical = [sz*sp for sz, sp in zip(fix.GetSize(), fix.GetSpacing())]
+    x, y = control_point_spacing, control_point_levels[-1]
+    control_point_grid = [max(1, int(sz / (x*y))) for sz in fix_size_physical]
+
+    # set initial transform
+    transform = sitk.BSplineTransformInitializer(
+        image1=fix, transformDomainMeshSize=control_point_grid, order=3,
+    )
+    irm.SetInitialTransformAsBSpline(
+        transform, inPlace=True, scaleFactors=control_point_levels,
+    )
+
+    # set masks
+    if fix_mask is not None:
+        fix_mask = ut.numpy_to_sitk(fix_mask, fix_spacing, origin=fix_origin)
+        irm.SetMetricFixedMask(fix_mask)
+    if mov_mask is not None:
+        mov_mask = ut.numpy_to_sitk(mov_mask, mov_spacing, origin=mov_origin)
+        irm.SetMetricMovingMask(mov_mask)
+
+    # execute alignment
+    irm.Execute(
+        sitk.Cast(fix, sitk.sitkFloat32),
+        sitk.Cast(mov, sitk.sitkFloat32),
+    )
+
+    # get initial and final metric values
+    initial_metric_value = irm.MetricEvaluate(
+        sitk.Cast(fix, sitk.sitkFloat32),
+        sitk.Cast(mov, sitk.sitkFloat32),
+    )
+    final_metric_value = irm.GetMetricValue()
+
+    # if registration improved metric return result
+    # otherwise return default
+    if final_metric_value < initial_metric_value:
+        sys.stdout.flush()
+        return ut.bspline_to_displacement_field(fix, transform)
+    else:
+        print("Optimization failed to improve metric")
+        print("Returning default")
+        sys.stdout.flush()
+        return None
 
