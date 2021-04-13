@@ -227,7 +227,6 @@ def piecewise_affine_align(
 
     # set up cluster
     with ClusterWrap.cluster(**cluster_kwargs) as cluster:
-        cluster.scale_cluster(np.prod(nblocks)+1)
 
         # construct dask array versions of objects
         fix_da = da.from_array(fix)
@@ -367,7 +366,6 @@ def piecewise_exhaustive_translation(
     step_sizes,
     smooth_sigma,
     mask=None,
-    nworkers=100,
     cluster_kwargs={},
     **kwargs,
     ):
@@ -411,7 +409,6 @@ def piecewise_exhaustive_translation(
 
     # set up cluster
     with ClusterWrap.cluster(**cluster_kwargs) as cluster:
-        cluster.scale_cluster(nworkers)
 
         # convert to dask arrays
         fix_blocks_da = da.from_array(
