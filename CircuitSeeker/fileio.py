@@ -151,6 +151,5 @@ def distributed_stack_to_hdf5(
     stack_paths_b = db.from_sequence(stack_paths, npartitions=nimages)
     write_paths_b = db.from_sequence(write_paths, npartitions=nimages)
     with ClusterWrap.cluster(**cluster_kwargs) as cluster:
-        cluster.scale_cluster(nimages + 1)
         stack_paths_b.map(stack_to_hdf5, write_paths_b, dims, dtype).compute()
 
