@@ -32,7 +32,6 @@ def distributed_image_mean(
                 frames['folder'], frames['prefix'],
                 frames['suffix'], frames['dataset_path'],
             )
-            cluster.scale_cluster(frames.shape[0] + 1)
             frames_mean = frames.mean(axis=0, dtype=np.float32).compute()
             frames_mean = np.round(frames_mean).astype(frames[0].dtype)
         # other types use dask.bag
@@ -41,7 +40,6 @@ def distributed_image_mean(
                 frames['folder'], frames['prefix'], frames['suffix'],
             )
             nframes = frames.npartitions
-            cluster.scale_cluster(frames.npartitions + 1)
             frames_mean = frames.map(csio.readImage).reduction(sum, sum).compute()
             dtype = frames_mean.dtype
             frames_mean = np.round(frames_mean/np.float(nframes)).astype(dtype)
@@ -66,19 +64,18 @@ def motion_correct(
         # wrap fixed data as delayed object
         fix_d = delayed(fix)
 
+        # get total number of frames
+        total_frames = len(csio.globPaths(
+            frames['folder'], frames['prefix'], frames['suffix'],
+        ))
+
         # create dask array of all frames
         frames_data = csio.daskArrayBackedByHDF5(
             frames['folder'], frames['prefix'],
             frames['suffix'], frames['dataset_path'],
+            stride=time_stride,
         )
-        total_frames = frames_data.shape[0]
-
-        # slice in time
-        frames_data = frames_data[::time_stride]
         compute_frames = frames_data.shape[0]
-
-        # scale the cluster
-        cluster.scale_cluster(compute_frames + 1)
 
         # set alignment defaults
         alignment_defaults = {
@@ -163,7 +160,7 @@ def resample_frames(
     transforms,
     write_path,
     mask=None,
-    subset=None,
+    time_stride=1,
     compression_level=4,
     cluster_kwargs={},
 ):
@@ -176,11 +173,13 @@ def resample_frames(
         frames_data = csio.daskArrayBackedByHDF5(
             frames['folder'], frames['prefix'],
             frames['suffix'], frames['dataset_path'],
+            stride=time_stride,
         )
+        total_frames = frames_data.shape[0]
 
         # wrap transforms as dask array
         # extra dimension to match frames_data ndims
-        transforms = transforms[:, None, :, :]
+        transforms = transforms[::time_stride, None, :, :]
         transforms_d = da.from_array(transforms, chunks=(1, 1, 4, 4))
 
         # wrap mask
@@ -190,15 +189,6 @@ def resample_frames(
             if mask_sh != frame_sh:
                 mask = zoom(mask, np.array(frame_sh) / mask_sh, order=0)
             mask_d = delayed(mask)
-
-        # slice subset
-        if subset is not None:
-            transforms = transforms[subset]
-            frames_data = frames_data[subset]
-        total_frames = frames_data.shape[0]
-
-        # scale cluster
-        cluster.scale_cluster(total_frames + 1)
 
         # wrap transform function
         def wrapped_apply_transform(mov, t, mask_d=None):
