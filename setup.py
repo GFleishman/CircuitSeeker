@@ -2,7 +2,7 @@ import setuptools
 
 setuptools.setup(
     name="CircuitSeeker",
-    version="0.1.2",
+    version="0.1.3",
     author="Greg M. Fleishman",
     author_email="greg.nli10me@gmail.com",
     description="Tools for finding neural circuits",
@@ -24,7 +24,7 @@ setuptools.setup(
         'zarr',
         'numcodecs',
         'morphsnakes',
-        'ClusterWrap',
+        'ClusterWrap>=0.1.1',
         'pynrrd',
     ]
 )
