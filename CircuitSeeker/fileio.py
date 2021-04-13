@@ -47,7 +47,7 @@ def daskBagOfFilePaths(folder, prefix, suffix, npartitions=None):
     return db.from_sequence(images, npartitions=npartitions)
 
 
-def daskArrayBackedByHDF5(folder, prefix, suffix, dataset_path):
+def daskArrayBackedByHDF5(folder, prefix, suffix, dataset_path, stride=None):
     """
     Returns dask.array backed by HDF5 files matching absolute path `folder/prefix*suffix`
     You must specify hdf5 dataset path with `dataset_path`
@@ -56,6 +56,8 @@ def daskArrayBackedByHDF5(folder, prefix, suffix, dataset_path):
     error_message = "daskArrayBackedByHDF5 requires hdf5 files with .h5 or .hdf5 extension"
     assert (testPathExtensionForHDF5(suffix)), error_message
     images = globPaths(folder, prefix, suffix)
+    if stride is not None:
+        images = images[::stride]
     dsets = [readHDF5(image, dataset_path) for image in images]
     arrays = [da.from_array(dset, chunks=dset.shape) for dset in dsets]
     return da.stack(arrays, axis=0)
