@@ -3,10 +3,10 @@ import numpy as np
 import dask.array as da
 import SimpleITK as sitk
 import ClusterWrap
-import CircuitSeeker.stitch as stitch
 import CircuitSeeker.utility as ut
 import greedypy.greedypy_registration_method as grm
 from scipy.ndimage import minimum_filter, gaussian_filter
+from dask_stitch.local_affine import local_affines_to_field
 
 
 def configure_irm(
@@ -221,10 +221,6 @@ def piecewise_affine_align(
     blocksize = np.ceil(blocksize).astype(np.int16)
     overlaps = blocksize // 2
 
-    # set cluster defaults
-    if 'cores' not in cluster_kwargs.keys():
-        cluster_kwargs['cores'] = 2
-
     # set up cluster
     with ClusterWrap.cluster(**cluster_kwargs) as cluster:
 
@@ -248,6 +244,7 @@ def piecewise_affine_align(
             rigid = affine_align(
                 fix, mov, fix_spacing, mov_spacing,
                 fix_mask=fm, mov_mask=mm,
+                rigid=True,
                 **kwargs,
             )
             return rigid.reshape((1,1,1,4,4))
@@ -270,7 +267,8 @@ def piecewise_affine_align(
             rigid = rigids[block_idx[0], block_idx[1], block_idx[2]]
             affine = affine_align(
                 fix, mov, fix_spacing, mov_spacing,
-                fix_mask=fm, mov_mask=mm, rigid=rigid,
+                fix_mask=fm, mov_mask=mm,
+                initial_transform=rigid,
                 **kwargs,
             )
             return affine.reshape((1,1,1,4,4))
@@ -287,9 +285,18 @@ def piecewise_affine_align(
             chunks=[1,1,1,4,4],
         ).compute()
 
+        # adjust affines for block origins
+        for i in range(np.prod(nblocks)):
+            x, y, z = np.unravel_index(i, nblocks)
+            origin = (blocksize * [x, y, z] - overlaps) * fix_spacing
+            tl, tr, a = np.eye(4), np.eye(4), affines[x, y, z]
+            tl[:3, -1], tr[:3, -1] = origin, -origin
+            affines[x, y, z] = np.matmul(tl, np.matmul(a, tr))
+
         # stitch local affines into displacement field
-        field = stitch.local_affine_to_displacement(
-            fix.shape, fix_spacing, affines, blocksize,
+        field = local_affines_to_field(
+            fix.shape, fix_spacing,
+            affines, blocksize, overlaps,
         ).compute()
 
         return field
