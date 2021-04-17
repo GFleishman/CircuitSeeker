@@ -2,7 +2,7 @@ import setuptools
 
 setuptools.setup(
     name="CircuitSeeker",
-    version="0.1.5",
+    version="0.1.6",
     author="Greg M. Fleishman",
     author_email="greg.nli10me@gmail.com",
     description="Tools for finding neural circuits",
@@ -28,5 +28,6 @@ setuptools.setup(
         'pynrrd',
         'greedypy',
         'dask-stitch>=0.0.2',
+        'bokeh',
     ]
 )
