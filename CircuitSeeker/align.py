@@ -225,6 +225,7 @@ def piecewise_affine_align(
     with ClusterWrap.cluster(**cluster_kwargs) as cluster:
 
         # construct dask array versions of objects
+        # extra dimensions to match field of affine matrices
         fix_da = da.from_array(fix)
         mov_da = da.from_array(mov)
         fm_da = da.from_array(fix_mask)
@@ -239,43 +240,36 @@ def piecewise_affine_align(
         fm_da = da.pad(fm_da, pads).rechunk(tuple(blocksize))
         mm_da = da.pad(mm_da, pads).rechunk(tuple(blocksize))
 
-        # closure for rigid align function
-        def single_rigid_align(fix, mov, fm, mm):
+        # closure for affine alignment
+        def single_affine_align(fix, mov, fm, mm, block_info=None):
+            # rigid alignment
             rigid = affine_align(
                 fix, mov, fix_spacing, mov_spacing,
                 fix_mask=fm, mov_mask=mm,
                 rigid=True,
                 **kwargs,
             )
-            return rigid.reshape((1,1,1,4,4))
-
-        # rigid align all chunks
-        rigids = da.map_overlap(
-            single_rigid_align, fix_da, mov_da, fm_da, mm_da,
-            depth=tuple(overlaps),
-            dtype=np.float32,
-            boundary='none',
-            trim=False,
-            align_arrays=False,
-            new_axis=[3,4],
-            chunks=[1,1,1,4,4],
-        ).compute()
-
-        # closure for affine align function
-        def single_affine_align(fix, mov, fm, mm, block_info=None):
-            block_idx = block_info[0]['chunk-location']
-            rigid = rigids[block_idx[0], block_idx[1], block_idx[2]]
+            # affine alignment
             affine = affine_align(
                 fix, mov, fix_spacing, mov_spacing,
                 fix_mask=fm, mov_mask=mm,
                 initial_transform=rigid,
                 **kwargs,
             )
+            # correct for block origin
+            idx = block_info[0]['chunk-location']
+            origin = np.maximum(0, blocksize * idx - overlaps)
+            origin = origin * fix_spacing
+            tl, tr = np.eye(4), np.eye(4)
+            tl[:3, -1], tr[:3, -1] = origin, -origin
+            affine = np.matmul(tl, np.matmul(affine, tr))
+            # return result
             return affine.reshape((1,1,1,4,4))
 
         # affine align all chunks
         affines = da.map_overlap(
-            single_affine_align, fix_da, mov_da, fm_da, mm_da,
+            single_affine_align,
+            fix_da, mov_da, fm_da, mm_da,
             depth=tuple(overlaps),
             dtype=np.float32,
             boundary='none',
@@ -284,14 +278,6 @@ def piecewise_affine_align(
             new_axis=[3,4],
             chunks=[1,1,1,4,4],
         ).compute()
-
-        # adjust affines for block origins
-        for i in range(np.prod(nblocks)):
-            x, y, z = np.unravel_index(i, nblocks)
-            origin = (blocksize * [x, y, z] - overlaps) * fix_spacing
-            tl, tr, a = np.eye(4), np.eye(4), affines[x, y, z]
-            tl[:3, -1], tr[:3, -1] = origin, -origin
-            affines[x, y, z] = np.matmul(tl, np.matmul(a, tr))
 
         # stitch local affines into displacement field
         field = local_affines_to_field(
