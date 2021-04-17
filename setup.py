@@ -14,6 +14,7 @@ setuptools.setup(
         'numpy',
         'scipy',
         'h5py',
+        'bokeh',
         'dask',
         'dask[array]',
         'dask[bag]',
@@ -28,6 +29,5 @@ setuptools.setup(
         'pynrrd',
         'greedypy',
         'dask-stitch>=0.0.2',
-        'bokeh',
     ]
 )
