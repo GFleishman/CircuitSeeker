@@ -300,10 +300,6 @@ def exhaustive_translation(
     """
     """
 
-    # squeeze any negligible dimensions
-    fix = fix.squeeze()
-    mov = mov.squeeze()
-
     # convert to sitk images
     fix_itk = ut.numpy_to_sitk(fix, fix_spacing, origin=fix_origin)
     mov_itk = ut.numpy_to_sitk(mov, mov_spacing, origin=mov_origin)
@@ -320,6 +316,8 @@ def exhaustive_translation(
     kwargs['num_steps'] = num_steps
     kwargs['step_sizes'] = step_sizes * fix_spacing
     kwargs['callback'] = callback
+    kwargs['shrink_factors'] = [1,]
+    kwargs['smooth_sigmas'] = [0,]
     irm = configure_irm(**kwargs)
 
     # set translation transform
@@ -347,7 +345,7 @@ def exhaustive_translation(
         trans = trans * step_sizes * fix_spacing
 
     # return translation in xyz order
-    return trans[::-1]
+    return trans
 
 
 def piecewise_exhaustive_translation(
@@ -414,7 +412,8 @@ def piecewise_exhaustive_translation(
         # closure for exhaustive translation alignment
         def wrapped_exhaustive_translation(x, y):
             t = exhaustive_translation(
-                x, y, fix_spacing, mov_spacing,
+                x.squeeze(), y.squeeze(),
+                fix_spacing, mov_spacing,
                 num_steps, step_sizes,
                 mov_origin=mov_origin,
                 **kwargs,
