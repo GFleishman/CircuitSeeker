@@ -2,7 +2,7 @@ import setuptools
 
 setuptools.setup(
     name="CircuitSeeker",
-    version="0.1.8",
+    version="0.1.9",
     author="Greg M. Fleishman",
     author_email="greg.nli10me@gmail.com",
     description="Tools for finding neural circuits",

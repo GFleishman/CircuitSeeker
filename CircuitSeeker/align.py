@@ -1,4 +1,4 @@
-import os, sys
+import os, sys, psutil
 import numpy as np
 import dask.array as da
 import SimpleITK as sitk
@@ -24,7 +24,10 @@ def configure_irm(
     """
 
     # set up registration object
-    ncores = int(os.environ["LSB_DJOB_NUMPROC"])  # TODO: LSF specific!
+    if "LSB_DJOB_NUMPROC" in os.environ:
+        ncores = int(os.environ["LSB_DJOB_NUMPROC"])  # XXX: LSF specific!
+    else:
+        ncores = psutil.cpu_count(logical=False)
     sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(2*ncores)
     irm = sitk.ImageRegistrationMethod()
     irm.SetNumberOfThreads(2*ncores)
