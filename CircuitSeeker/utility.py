@@ -107,6 +107,16 @@ def field_to_displacement_field_transform(field, spacing):
     return sitk.DisplacementFieldTransform(transform)
 
 
+def bspline_parameters_to_transform(parameters):
+    """
+    """
+
+    t = sitk.BSplineTransform(3, 3)
+    t.SetFixedParameters(parameters[:18])
+    t.SetParameters(parameters[18:])
+    return t
+
+
 def bspline_to_displacement_field(reference, bspline):
     """
     """
@@ -116,6 +126,5 @@ def bspline_to_displacement_field(reference, bspline):
         reference.GetSize(), reference.GetOrigin(),
         reference.GetSpacing(), reference.GetDirection(),
     )
-    return sitk.GetArrayFromImage(df).astype(np.float32)
-
+    return sitk.GetArrayFromImage(df).astype(np.float32)[..., ::-1]
 

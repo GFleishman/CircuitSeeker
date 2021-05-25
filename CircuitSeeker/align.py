@@ -13,6 +13,7 @@ def configure_irm(
     metric='MI', bins=128,
     sampling='regular', sampling_percentage=1.0,
     optimizer='GD', iterations=200, learning_rate=1.0,
+    estimate_learning_rate="Once",
     min_step=0.1, max_step=1.0,
     shrink_factors=[2,1],
     smooth_sigmas=[2,1],
@@ -25,7 +26,7 @@ def configure_irm(
 
     # set up registration object
     if "LSB_DJOB_NUMPROC" in os.environ:
-        ncores = int(os.environ["LSB_DJOB_NUMPROC"])  # XXX: LSF specific!
+        ncores = int(os.environ["LSB_DJOB_NUMPROC"])
     else:
         ncores = psutil.cpu_count(logical=False)
     sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(2*ncores)
@@ -52,11 +53,21 @@ def configure_irm(
         irm.SetMetricSamplingStrategy(irm.RANDOM)
     irm.SetMetricSamplingPercentage(sampling_percentage)
 
+    # set estimate learning rate
+    if estimate_learning_rate == "Never":
+        estimate_learning_rate = irm.Never
+    elif estimate_learning_rate == "Once":
+        estimate_learning_rate = irm.Once
+    elif estimate_learning_rate == "EachIteration":
+        estimate_learning_rate = irm.EachIteration
+
     # set optimizer
     if optimizer == 'GD':
         irm.SetOptimizerAsGradientDescent(
             numberOfIterations=iterations,
             learningRate=learning_rate,
+            maximumStepSizeInPhysicalUnits=max_step,
+            estimateLearningRate=estimate_learning_rate,
         )
         irm.SetOptimizerScalesFromPhysicalShift()
     elif optimizer == 'RGD':
@@ -100,6 +111,7 @@ def affine_align(
     fix_origin=None,
     mov_origin=None,
     default=np.eye(4),
+    foreground_percentage_threshold=0.2,
     **kwargs,
 ):
     """
@@ -110,17 +122,16 @@ def affine_align(
         default = initial_transform
 
     # if using masks, ensure there is sufficient foreground
-    FOREGROUND_PERCENTAGE_THRESHOLD = 0.2
     if fix_mask is not None:
         foreground_percentage = np.sum(fix_mask) / np.prod(fix_mask.shape)
-        if foreground_percentage < FOREGROUND_PERCENTAGE_THRESHOLD:
+        if foreground_percentage < foreground_percentage_threshold:
             print("Too little foreground data in fixed image")
             print("Returning default")
             sys.stdout.flush()
             return default
     if mov_mask is not None:
         foreground_percentage = np.sum(mov_mask) / np.prod(mov_mask.shape)
-        if foreground_percentage < FOREGROUND_PERCENTAGE_THRESHOLD:
+        if foreground_percentage < foreground_percentage_threshold:
             print("Too little foreground data in moving image")
             print("Returning default")
             sys.stdout.flush()
@@ -131,9 +142,9 @@ def affine_align(
         fix, fix_spacing_ss = ut.skip_sample(fix, fix_spacing, alignment_spacing)
         mov, mov_spacing_ss = ut.skip_sample(mov, mov_spacing, alignment_spacing)
         if fix_mask is not None:
-            fix_mask, _ = ut.skip_sample(fix_mask, fix_vox, alignment_spacing)
+            fix_mask, _ = ut.skip_sample(fix_mask, fix_spacing, alignment_spacing)
         if mov_mask is not None:
-            mov_mask, _ = ut.skip_sample(mov_mask, mov_vox, alignment_spacing)
+            mov_mask, _ = ut.skip_sample(mov_mask, mov_spacing, alignment_spacing)
         fix_spacing = fix_spacing_ss
         mov_spacing = mov_spacing_ss
 
@@ -562,20 +573,33 @@ def piecewise_deformable_align_greedypy(
     return deformation, resampled
 
 
-def deformable_align(
+def bspline_deformable_align(
     fix, mov,
     fix_spacing, mov_spacing,
     control_point_spacing,
     control_point_levels,
+    alignment_spacing=None,
     initial_transform=None,
     fix_mask=None,
     mov_mask=None,
     fix_origin=None,
     mov_origin=None,
+    return_parameters=False,
     **kwargs,
 ):
     """
     """
+
+    # skip sample to alignment spacing
+    if alignment_spacing is not None:
+        fix, fix_spacing_ss = ut.skip_sample(fix, fix_spacing, alignment_spacing)
+        mov, mov_spacing_ss = ut.skip_sample(mov, mov_spacing, alignment_spacing)
+        if fix_mask is not None:
+            fix_mask, _ = ut.skip_sample(fix_mask, fix_spacing, alignment_spacing)
+        if mov_mask is not None:
+            mov_mask, _ = ut.skip_sample(mov_mask, mov_spacing, alignment_spacing)
+        fix_spacing = fix_spacing_ss
+        mov_spacing = mov_spacing_ss
 
     # convert to sitk images
     fix = ut.numpy_to_sitk(fix, fix_spacing, origin=fix_origin)
@@ -628,7 +652,12 @@ def deformable_align(
     # otherwise return default
     if final_metric_value < initial_metric_value:
         sys.stdout.flush()
-        return ut.bspline_to_displacement_field(fix, transform)
+        if return_parameters:
+            fp = transform.GetFixedParameters()
+            pp = transform.GetParameters()
+            return np.array(list(fp) + list(pp))
+        else:
+            return ut.bspline_to_displacement_field(fix, transform)
     else:
         print("Optimization failed to improve metric")
         print("Returning default")

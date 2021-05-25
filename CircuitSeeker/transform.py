@@ -1,5 +1,6 @@
 import SimpleITK as sitk
 import CircuitSeeker.utility as ut
+import os, psutil
 
 
 def apply_transform(
@@ -13,26 +14,50 @@ def apply_transform(
     """
     """
 
+    # set global number of threads
+    if "LSB_DJOB_NUMPROC" in os.environ:
+        ncores = int(os.environ["LSB_DJOB_NUMPROC"])
+    else:
+        ncores = psutil.cpu_count(logical=False)
+    sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(2*ncores)
+
+    # set up resampler
+    resampler = sitk.ResampleImageFilter()
+    resampler.SetNumberOfThreads(2*ncores)
+
     # convert images to sitk objects
     dtype = fix.dtype
     fix = ut.numpy_to_sitk(fix, fix_spacing, fix_origin)
     mov = ut.numpy_to_sitk(mov, mov_spacing, mov_origin)
 
-    # default transform spacing is fixed voxel spacing
-    if transform_spacing is None:
-        transform_spacing = fix_spacing
-
     # construct transform
     transform = sitk.CompositeTransform(3)
-    for t in transform_list:
+    for i, t in enumerate(transform_list):
+
+        # affine transforms
         if len(t.shape) == 2:
             t = ut.matrix_to_affine_transform(t)
+
+        # bspline parameters
+        elif len(t.shape) == 1:
+            t = ut.bspline_parameters_to_transform(t)
+
+        # fields
         elif len(t.shape) == 4:
-            t = ut.field_to_displacement_field_transform(t, transform_spacing)
+            # set transform_spacing
+            if transform_spacing is None:
+                sp = fix_spacing
+            elif isinstance(transform_spacing[i], tuple):
+                sp = transform_spacing[i]
+            else:
+                sp = transform_spacing
+            # create field
+            t = ut.field_to_displacement_field_transform(t, sp)
+
+        # add to composite transform
         transform.AddTransform(t)
 
     # set up resampler object
-    resampler = sitk.ResampleImageFilter()
     resampler.SetReferenceImage(sitk.Cast(fix, sitk.sitkFloat32))
     resampler.SetInterpolator(sitk.sitkLinear)
     resampler.SetDefaultPixelValue(0)
