@@ -25,9 +25,9 @@ setuptools.setup(
         'zarr',
         'numcodecs',
         'morphsnakes',
-        'ClusterWrap>=0.1.3',
+        'ClusterWrap>=0.1.6',
         'pynrrd',
         'greedypy',
-        'dask-stitch>=0.0.2',
+        'dask-stitch>=0.2.1',
     ]
 )
