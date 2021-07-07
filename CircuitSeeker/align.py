@@ -7,6 +7,7 @@ import CircuitSeeker.utility as ut
 import greedypy.greedypy_registration_method as grm
 from scipy.ndimage import minimum_filter, gaussian_filter
 from dask_stitch.local_affine import local_affines_to_field
+import time
 
 
 def configure_irm(
@@ -238,21 +239,49 @@ def piecewise_affine_align(
     # set up cluster
     with ClusterWrap.cluster(**cluster_kwargs) as cluster:
 
-        # construct dask array versions of objects
-        # extra dimensions to match field of affine matrices
-        fix_da = da.from_array(fix)
-        mov_da = da.from_array(mov)
-        fm_da = da.from_array(fix_mask)
-        mm_da = da.from_array(mov_mask)
-
         # pad the ends to fill in the last blocks
         # blocks must all be exact for stitch to work correctly
         pads = [(0, y - x % y) if x % y > 0
             else (0, 0) for x, y in zip(fix.shape, blocksize)]
-        fix_da = da.pad(fix_da, pads).rechunk(tuple(blocksize))
-        mov_da = da.pad(mov_da, pads).rechunk(tuple(blocksize))
-        fm_da = da.pad(fm_da, pads).rechunk(tuple(blocksize))
-        mm_da = da.pad(mm_da, pads).rechunk(tuple(blocksize))
+        fix_p = np.pad(fix, pads)
+        mov_p = np.pad(mov, pads)
+        fm_p = np.pad(fm, pads)
+        mm_p = np.pad(mm, pads)
+
+        # give the scheduler some time to allocate workers
+        time.sleep(30)
+
+        # CONSTRUCT DASK ARRAY VERSION OF OBJECTS
+        # fix
+        fix_future = cluster.client.scatter(fix_p)
+        fix_da = da.from_delayed(
+            fix_future, shape=fix_p.shape, dtype=fix_p.dtype
+        ).rechunk(tuple(blocksize))
+        fix_da.persist()
+
+        # mov
+        mov_future = cluster.client.scatter(mov_p)
+        mov_da = da.from_delayed(
+            mov_future, shape=mov_p.shape, dtype=mov_p.dtype
+        ).rechunk(tuple(blocksize))
+        mov_da.persist()
+
+        # fix mask
+        fm_future = cluster.client.scatter(fm_p)
+        fm_da = da.from_delayed(
+            fm_future, shape=fm_p.shape, dtype=fm_p.dtype
+        ).rechunk(tuple(blocksize))
+        fm_da.persist()
+
+        # mov mask
+        mm_future = cluster.client.scatter(mm_p)
+        mm_da = da.from_delayed(
+            mm_future, shape=mm_p.shape, dtype=mm_p.dtype
+        ).rechunk(tuple(blocksize))
+        mm_da.persist()
+
+        # rebalance to make sure even distribution of data
+        cluster.client.rebalance()
 
         # closure for affine alignment
         def single_affine_align(fix, mov, fm, mm, block_info=None):
@@ -585,6 +614,7 @@ def bspline_deformable_align(
     fix_origin=None,
     mov_origin=None,
     return_parameters=False,
+    default=None,
     **kwargs,
 ):
     """
@@ -627,6 +657,14 @@ def bspline_deformable_align(
         transform, inPlace=True, scaleFactors=control_point_levels,
     )
 
+    # store initial transform coordinates as default
+    if default is None and return_parameters:
+        fp = transform.GetFixedParameters()
+        pp = transform.GetParameters()
+        default = np.array(list(fp) + list(pp))
+    elif default is None:
+        default = ut.bspline_to_displacement_field(fix, transform)
+
     # set masks
     if fix_mask is not None:
         fix_mask = ut.numpy_to_sitk(fix_mask, fix_spacing, origin=fix_origin)
@@ -662,5 +700,5 @@ def bspline_deformable_align(
         print("Optimization failed to improve metric")
         print("Returning default")
         sys.stdout.flush()
-        return None
+        return default
 
