@@ -245,8 +245,8 @@ def piecewise_affine_align(
             else (0, 0) for x, y in zip(fix.shape, blocksize)]
         fix_p = np.pad(fix, pads)
         mov_p = np.pad(mov, pads)
-        fm_p = np.pad(fm, pads)
-        mm_p = np.pad(mm, pads)
+        fm_p = np.pad(fix_mask, pads)
+        mm_p = np.pad(mov_mask, pads)
 
         # give the scheduler some time to allocate workers
         time.sleep(30)
