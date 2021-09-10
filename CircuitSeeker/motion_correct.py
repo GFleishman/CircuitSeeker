@@ -67,7 +67,7 @@ def motion_correct(
         fix_d = cluster.client.scatter(fix, broadcast=True)
         # scatter fixed mask to cluster
         fix_mask_d = None
-        if fix_mask:
+        if fix_mask is not None:
             fix_mask_d = cluster.client.scatter(fix_mask, broadcast=True)
 
         # get total number of frames
