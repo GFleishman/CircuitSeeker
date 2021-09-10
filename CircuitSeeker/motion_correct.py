@@ -54,6 +54,7 @@ def motion_correct(
     fix_spacing, frames_spacing,
     time_stride=1,
     sigma=7,
+    fix_mask=None,
     cluster_kwargs={},
     **kwargs,
 ):
@@ -64,6 +65,9 @@ def motion_correct(
 
         # wrap fixed data as delayed object
         fix_d = delayed(fix)
+
+        # wrap fix mask if given
+        fix_mask_d = delayed(fix_mask) if fix_mask else None
 
         # get total number of frames
         total_frames = len(csio.globPaths(
@@ -94,10 +98,11 @@ def motion_correct(
                 kwargs[k] = v
  
         # wrap align function
-        def wrapped_affine_align(mov, fix_d):
+        def wrapped_affine_align(mov, fix_d, fix_mask_d):
             mov = mov.squeeze()
             t = affine_align(
                 fix_d, mov, fix_spacing, frames_spacing,
+                fix_mask=fix_mask_d,
                 **kwargs,
             )
             e = ut.matrix_to_euler_transform(t)
@@ -107,6 +112,7 @@ def motion_correct(
         params = da.map_blocks(
             wrapped_affine_align, frames_data,
             fix_d=fix_d,
+            fix_mask_d=fix_mask_d,
             dtype=np.float64,
             drop_axis=[2, 3,],
             chunks=[1, 6],
