@@ -1085,29 +1085,88 @@ def distributed_piecewise_exhaustive_translation(
         return dvf
 
 
-
-
-
-
-# TODO: still need to refactor deformable
-
 def deformable_align_greedypy(
-    fixed, moving,
-    fixed_vox, moving_vox,
-    radius=32,
+    fix,
+    mov,
+    fix_spacing,
+    mov_spacing,
+    radius,
     gradient_smoothing=[3.0, 0.0, 1.0, 2.0],
     field_smoothing=[0.5, 0.0, 1.0, 6.0],
     iterations=[200,100],
     shrink_factors=[2,1],
     smooth_sigmas=[1,0],
     step=5.0,
-    ):
+):
     """
+    Deformable alignment of moving to fixed image. Does not use
+    itk::simple::ImageRegistrationMethod API, so parameter
+    formats are different. See greedypy package for more details.
+
+    Parameters
+    ----------
+    fix : ndarray
+        the fixed image
+
+    mov : ndarray
+        the moving image; `fix.shape` must equal `mov.shape`
+        I.e. typically deformable alignment is done after
+        a global affine alignment wherein the moving image has
+        been resampled onto the fixed image voxel grid.
+
+    fix_spacing : 1d array
+        The spacing in physical units (e.g. mm or um) between voxels
+        of the fixed image.
+        Length must equal `fix.ndim`
+
+    mov_spacing : 1d array
+        The spacing in physical units (e.g. mm or um) between voxels
+        of the moving image.
+        Length must equal `mov.ndim`
+
+    radius : int
+        greedypy uses local correlation as an image matching metric.
+        This is the radius of neighborhoods used for local correlation.
+
+    gradient_smoothing : list of 4 floats (default: [3., 0., 1., 2.])
+        Parameters for smoothing the gradient of the image matching
+        metric at each iteration.
+        greedypy uses the differential operator format for smoothing.
+        These parameters are a, b, c, and d in: (a*lap + b*graddiv + c)^d
+        where lap is the Laplacian operator and graddiv is the gradient
+        of divergence operator.
+
+    field_smoothing : list of 4 floats (default: [.5, 0., 1., 6.])
+        Parameters for smoothing the total field at every iteration.
+        See `gradient_smoothing` for more details.
+
+    iterations : iterable of type int (default: [200, 100])
+        The maximum number of iterations to run at each scale level.
+        Optimization may still converge early.
+
+    shrink_factors : iterable of type int (default: [2, 1])
+        Downsampling factors for each scale level.
+        `len(shrink_facors)` must equal `len(iterations)`.
+
+    smooth_sigmas : iterable of type float (default: [1., 0.])
+        Sigma of Gaussian smoothing kernel applied before downsampling
+        images at each scale level. `len(smooth_sigmas)` must equal
+        `len(iterations)`
+
+    step : float (default: 5.)
+        Gradient descent step size
+
+    Returns
+    -------
+        field : ndarray
+            Displacement vector field matching moving image to fixed
     """
 
     register = grm.greedypy_registration_method(
-        fixed, fixed_vox,
-        moving, moving_vox,
+        fix,
+        fix_spacing,
+        mov,
+        mov_spacing,
         iterations,
         shrink_factors,
         smooth_sigmas,
@@ -1122,78 +1181,97 @@ def deformable_align_greedypy(
 
 
 def distributed_piecewise_deformable_align_greedypy(
-    fixed, moving,
-    fixed_vox, moving_vox,
-    affine_matrix,
-    block_size=[96,96,96],
-    overlap=16, 
-    distributed_state=None,
-    ):
+    fix,
+    mov,
+    fix_spacing,
+    mov_spacing,
+    nblocks,
+    overlap=0.5, 
+    cluster_kwargs={},
+    **kwargs,
+):
     """
+    Deformable alignment of overlapping blocks. Blocks are run
+    through `greedypy_deformable_align` in parallel on distributed
+    hardware.
+
+    Parameters
+    ----------
+    fix : ndarray
+        the fixed image
+
+    mov : ndarray
+        the moving image; `fix.shape` must equal `mov.shape`
+        I.e. typically deformable alignment is done after
+        a global affine alignment wherein the moving image has
+        been resampled onto the fixed image voxel grid.
+
+    fix_spacing : 1d array
+        The spacing in physical units (e.g. mm or um) between voxels
+        of the fixed image.
+        Length must equal `fix.ndim`
+
+    mov_spacing : 1d array
+        The spacing in physical units (e.g. mm or um) between voxels
+        of the moving image.
+        Length must equal `mov.ndim`
+
+    nblocks : iterable
+        The number of blocks to use along each axis.
+        Length should be equal to `fix.ndim`
+
+    overlap : float in range [0, 1] (default: 0.5)
+        Block overlap size as a percentage of block size
+
+    cluster_kwargs : dict (default: {})
+        Arguments passed to ClusterWrap.cluster
+        If working with an LSF cluster, this will be
+        ClusterWrap.janelia_lsf_cluster. If on a workstation
+        this will be ClusterWrap.local_cluster.
+        This is how distribution parameters are specified.
+
+    kwargs : any additional arguments
+        Passed to `greedypy_deformable_align` for every block
+
+    Returns
+    -------
+        field : ndarray
+            Displacement vector field stitched from local block alignment
     """
 
-    # reasmple moving image with affine
-    moving_res = apply_transform(
-        fixed, moving,
-        fixed_vox, moving_vox,
-        matrix=affine_matrix
-    )
+    # compute block size and overlaps
+    blocksize = np.array(fix.shape).astype(np.float32) / nblocks
+    blocksize = np.ceil(blocksize).astype(np.int16)
+    overlaps = np.round(blocksize * overlap).astype(np.int16)
 
     # set up cluster
-    # TODO: need way to pass distributed_state as context manager?
-    with csd.distributedState() as ds:
+    with ClusterWrap.cluster(**cluster_kwargs) as cluster:
 
-        # TODO: expose cores/tpw, remove job_extra -P
-        ds.initializeLSFCluster(
-            job_extra=["-P scicompsoft"],
-            ncpus=1,
-            cores=1,
-            threads_per_worker=2,
-            memory="15GB",
-            mem=15000,
-        )
-        ds.initializeClient()
-        nchunks = np.ceil(np.array(fixed.shape)/block_size)
-        ds.scaleCluster(njobs=np.prod(nchunks))
+        # pad the ends to fill in the last blocks
+        # blocks must all be exact for stitch to work correctly
+        pads = [(0, y - x % y) if x % y > 0
+            else (0, 0) for x, y in zip(fix.shape, blocksize)]
+        fix_p = np.pad(fix, pads)
+        mov_p = np.pad(mov, pads)
 
-    # TODO: refactor into a function, generalize w.r.t. dimension, share on github
-    # TODO: pad array so large overlaps will work (chunk can't be smaller than overlap)
-    # chunk ndarrays onto workers and stack as single dask array
-        bs = block_size  # shorthand
-        fixed_blocks = [[
-            [da.from_array(fixed[i:i+bs[0], j:j+bs[1], k:k+bs[2]])
-            for k in range(0, fixed.shape[2], bs[2])]
-            for j in range(0, fixed.shape[1], bs[1])]
-            for i in range(0, fixed.shape[0], bs[0])]
-        fixed_da = da.block(fixed_blocks)
-        moving_blocks = [[
-            [da.from_array(moving_res[i:i+bs[0], j:j+bs[1], k:k+bs[2]])
-            for k in range(0, moving_res.shape[2], bs[2])]
-            for j in range(0, moving_res.shape[1], bs[1])]
-            for i in range(0, moving_res.shape[0], bs[0])]
-        moving_da = da.block(moving_blocks)
-    
-        # deform all chunks
-        # TODO: need way to get registration parameters as input to this function
-        compute_blocks = [x + 2*overlap for x in block_size] + [3,]
-        deformation = da.map_overlap(
-            lambda w,x,y,z: deformableAlign(w, x, y, z),
-            fixed_da, moving_da,
-            depth=overlap,
-            dtype=np.float32,
-            chunks=compute_blocks,
-            new_axis=[3,],
-            align_arrays=False,
-            boundary='reflect',
-            y=fixed_vox, z=fixed_vox,
-        ).compute()
+        # scatter fix data to cluster
+        fix_future = cluster.client.scatter(fix_p)
+        fix_da = da.from_delayed(
+            fix_future, shape=fix_p.shape, dtype=fix_p.dtype
+        ).rechunk(tuple(blocksize))
 
-    # TODO: TEMP
-    resampled = apply_transform(
-       fixed, moving_res, fixed_vox, fixed_vox, displacement=deformation
-    )
+        # scatter mov data to cluster
+        mov_future = cluster.client.scatter(mov_p)
+        mov_da = da.from_delayed(
+            mov_future, shape=mov_p.shape, dtype=mov_p.dtype
+        ).rechunk(tuple(blocksize))
 
-    return deformation, resampled
+
+
+
+
+
+
 
 
 def bspline_deformable_align(
