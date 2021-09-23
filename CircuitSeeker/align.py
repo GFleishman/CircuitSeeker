@@ -7,8 +7,9 @@ import CircuitSeeker.utility as ut
 from CircuitSeeker.transform import apply_transform
 import greedypy.greedypy_registration_method as grm
 from scipy.ndimage import minimum_filter, gaussian_filter
+
+# TODO: need to refactor stitching
 from dask_stitch.local_affine import local_affines_to_field
-import time
 
 
 def configure_irm(
@@ -539,6 +540,7 @@ def distributed_piecewise_affine_align(
             chunks=[1,1,1,4,4],
         ).compute()
 
+        # TODO: interface may change here
         # stitch local affines into displacement field
         field = local_affines_to_field(
             fix.shape, fix_spacing,
@@ -1186,6 +1188,7 @@ def distributed_piecewise_deformable_align_greedypy(
     fix_spacing,
     mov_spacing,
     nblocks,
+    radius,
     overlap=0.5, 
     cluster_kwargs={},
     **kwargs,
@@ -1219,6 +1222,10 @@ def distributed_piecewise_deformable_align_greedypy(
     nblocks : iterable
         The number of blocks to use along each axis.
         Length should be equal to `fix.ndim`
+
+    radius : int
+        greedypy uses local correlation as an image matching metric.
+        This is the radius of neighborhoods used for local correlation.
 
     overlap : float in range [0, 1] (default: 0.5)
         Block overlap size as a percentage of block size
@@ -1266,30 +1273,134 @@ def distributed_piecewise_deformable_align_greedypy(
             mov_future, shape=mov_p.shape, dtype=mov_p.dtype
         ).rechunk(tuple(blocksize))
 
+        # closure for greedypy_deformable_align
+        def single_deformable_align(fix, mov):
+            return greedypy_deformable_align(
+                fix, mov, fix_spacing, mov_spacing,
+                radius, **kwargs
+            ).reshape((1,)*fix.ndim + fix.shape + (3,))
 
+        # determine output chunk shape
+        output_chunks = tuple(x+2*y for x, y in zip(blocksize, overlaps))
+        output_chunks = (1,)*fix.ndim + output_chunks + (3,)
 
+        # deform all chunks
+        fields = da.map_overlap(
+            single_deformable_align,
+            fix_da, mov_da,
+            depth=tuple(overlaps),
+            dtype=np.float32,
+            boundary=0,
+            trim=False,
+            align_arrays=False,
+            new_axis=[3,4,5,6],
+            chunks=output_chunks,
+        ).compute()
 
+        # TODO need a stitching function here
+        # stitch local fields
+        field = stitch_fields(
+            fix.shape, fix_spacing,
+            affines, blocksize, overlaps,
+        ).compute()
 
-
-
-
+        # return
+        return field
+            
 
 def bspline_deformable_align(
-    fix, mov,
-    fix_spacing, mov_spacing,
+    fix,
+    mov,
+    fix_spacing,
+    mov_spacing,
     control_point_spacing,
     control_point_levels,
-    alignment_spacing=None,
     initial_transform=None,
+    alignment_spacing=None,
     fix_mask=None,
     mov_mask=None,
     fix_origin=None,
     mov_origin=None,
-    return_parameters=False,
     default=None,
     **kwargs,
 ):
     """
+    Register moving to fixed image with a bspline parameterized deformation field
+
+    Parameters
+    ----------
+    fix : ndarray
+        the fixed image
+
+    mov : ndarray
+        the moving image; `fix.ndim` must equal `mov.ndim`
+
+    fix_spacing : 1d array
+        The spacing in physical units (e.g. mm or um) between voxels
+        of the fixed image.
+        Length must equal `fix.ndim`
+
+    mov_spacing : 1d array
+        The spacing in physical units (e.g. mm or um) between voxels
+        of the moving image.
+
+    control_point_spacing : float
+        The spacing in physical units (e.g. mm or um) between control
+        points that parameterize the deformation. Smaller means
+        more precise alignment, but also longer compute time. Larger
+        means shorter compute time and smoother transform, but less
+        precise.
+
+    control_point_levels : list of type int
+        The optimization scales for control point spacing. E.g. if
+        `control_point_spacing` is 100.0 and `control_point_levels`
+        is [1, 2, 4] then method will optimize at 400.0 units control
+        points spacing, then optimize again at 200.0 units, then again
+        at the requested 100.0 units control point spacing.
+    
+    initial_transform : 4x4 array (default: None)
+        An initial rigid or affine matrix from which to initialize
+        the optimization
+
+    alignment_spacing : float (default: None)
+        Fixed and moving images are skip sampled to a voxel spacing
+        as close as possible to this value. Intended for very fast
+        simple alignments (e.g. low amplitude motion correction)
+
+    fix_mask : binary ndarray (default: None)
+        A mask limiting metric evaluation region of the fixed image
+
+    mov_mask : binary ndarray (default: None)
+        A mask limiting metric evaluation region of the moving image
+
+    fix_origin : 1d array (default: None)
+        Origin of the fixed image.
+        Length must equal `fix.ndim`
+
+    mov_origin : 1d array (default: None)
+        Origin of the moving image.
+        Length must equal `mov.ndim`
+
+    default : any object (default: None)
+        If optimization fails to improve image matching metric,
+        print an error but also return this object. If None
+        the parameters and displacement field for an identity
+        transform are returned.
+
+    **kwargs : any additional arguments
+        Passed to `configure_irm`
+        This is where you would set things like:
+        metric, iterations, shrink_factors, and smooth_sigmas
+
+    Returns
+    -------
+    params : 1d array
+        The complete set of control point parameters concatenated
+        as a 1d array.
+
+    field : ndarray
+        The displacement field parameterized by the bspline control
+        points
     """
 
     # skip sample to alignment spacing
@@ -1330,12 +1441,12 @@ def bspline_deformable_align(
     )
 
     # store initial transform coordinates as default
-    if default is None and return_parameters:
+    if default is None:
         fp = transform.GetFixedParameters()
         pp = transform.GetParameters()
-        default = np.array(list(fp) + list(pp))
-    elif default is None:
-        default = ut.bspline_to_displacement_field(fix, transform)
+        default_params = np.array(list(fp) + list(pp))
+        default_field = ut.bspline_to_displacement_field(fix, transform)
+        default = (default_params, default_field)
 
     # set masks
     if fix_mask is not None:
@@ -1362,12 +1473,11 @@ def bspline_deformable_align(
     # otherwise return default
     if final_metric_value < initial_metric_value:
         sys.stdout.flush()
-        if return_parameters:
-            fp = transform.GetFixedParameters()
-            pp = transform.GetParameters()
-            return np.array(list(fp) + list(pp))
-        else:
-            return ut.bspline_to_displacement_field(fix, transform)
+        fp = transform.GetFixedParameters()
+        pp = transform.GetParameters()
+        params = np.array(list(fp) + list(pp))
+        field = ut.bspline_to_displacement_field(fix, transform)
+        return params, field
     else:
         print("Optimization failed to improve metric")
         print("Returning default")
