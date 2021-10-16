@@ -23,6 +23,32 @@ def distributed_image_mean(
     cluster_kwargs={},
 ):
     """
+    Voxelwise mean over all images specified by frames.
+    Distributed with Dask for expediency.
+
+    Parameters
+    ----------
+    frames : dict
+        Specifies the image set on disk to be averaged. At least three
+        keys must be defined:
+            'folder' : directory containing the image set
+            'prefix' : common prefix to all images being averaged
+            'suffix' : common suffix - typically the file extension
+        Common values for suffix are '.h5', '.stack', or '.tiff'
+
+        If suffix is '.h5' then an additional key must be defined:
+            'dataset_path' : path to image dataset within hdf5 container
+
+        If suffix is '.stack' then two additional keys must be defined:
+            'dtype' : a numpy datatype object for the datatype in the raw images
+            'shape' : the array shape of the data as a tuple
+
+    cluster_kwargs : dict (default: {})
+        Arguments passed to ClusterWrap.cluster
+        If working with an LSF cluster, this will be
+        ClusterWrap.janelia_lsf_cluster. If on a workstation
+        this will be ClusterWrap.local_cluster.
+        This is how distribution parameters are specified.
     """
 
     with ClusterWrap.cluster(**cluster_kwargs) as cluster:
@@ -32,6 +58,14 @@ def distributed_image_mean(
             frames = csio.daskArrayBackedByHDF5(
                 frames['folder'], frames['prefix'],
                 frames['suffix'], frames['dataset_path'],
+            )
+            frames_mean = frames.mean(axis=0, dtype=np.float32).compute()
+            frames_mean = np.round(frames_mean).astype(frames[0].dtype)
+        # stack files use dask.array
+        elif csio.testPathExtensionForSTACK(frames['suffix']):
+            frames = csio.daskArrayBackedBySTACK(
+                frames['folder'], frames['prefix'], frames['suffix'],
+                frames['dtype'], frames['shape'],
             )
             frames_mean = frames.mean(axis=0, dtype=np.float32).compute()
             frames_mean = np.round(frames_mean).astype(frames[0].dtype)
@@ -75,12 +109,19 @@ def motion_correct(
             frames['folder'], frames['prefix'], frames['suffix'],
         ))
 
-        # create dask array of all frames
-        frames_data = csio.daskArrayBackedByHDF5(
-            frames['folder'], frames['prefix'],
-            frames['suffix'], frames['dataset_path'],
-            stride=time_stride,
-        )
+        # crate dask array of all frames
+        if csio.testPathExtensionForHDF5(frames['suffix']):
+            frames_data = csio.daskArrayBackedByHDF5(
+                frames['folder'], frames['prefix'],
+                frames['suffix'], frames['dataset_path'],
+                stride=time_stride,
+            )
+        elif csio.testPathExtensionForSTACK(frames['suffix']):
+            frames_data = csio.daskArrayBackedBySTACK(
+                frames['folder'], frames['prefix'], frames['suffix'],
+                frames['dtype'], frames['shape'],
+                stride=time_stride,
+            )
         compute_frames = frames_data.shape[0]
 
         # set alignment defaults
@@ -288,12 +329,19 @@ def resample_frames(
     with ClusterWrap.cluster(**cluster_kwargs) as cluster:
 
         # create dask array of all frames
-        frames_data = csio.daskArrayBackedByHDF5(
-            frames['folder'], frames['prefix'],
-            frames['suffix'], frames['dataset_path'],
-            stride=time_stride,
-        )
-        total_frames = frames_data.shape[0]
+        if csio.testPathExtensionForHDF5(frames['suffix']):
+            frames_data = csio.daskArrayBackedByHDF5(
+                frames['folder'], frames['prefix'],
+                frames['suffix'], frames['dataset_path'],
+                stride=time_stride,
+            )
+        elif csio.testPathExtensionForSTACK(frames['suffix']):
+            frames_data = csio.daskArrayBackedBySTACK(
+                frames['folder'], frames['prefix'], frames['suffix'],
+                frames['dtype'], frames['shape'],
+                stride=time_stride,
+            )
+        compute_frames = frames_data.shape[0]
 
         # wrap transforms as dask array
         # extra dimension to match frames_data ndims
@@ -309,7 +357,7 @@ def resample_frames(
             mask_sh, frame_sh = mask.shape, frames_data.shape[1:]
             if mask_sh != frame_sh:
                 mask = zoom(mask, np.array(frame_sh) / mask_sh, order=0)
-            mask_d = delayed(mask)
+            mask_d = cluster.client.scatter(mask, broadcast=True)
 
         # wrap transform function
         def wrapped_apply_transform(mov, t, mask_d=None):

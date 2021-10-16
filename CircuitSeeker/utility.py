@@ -16,6 +16,13 @@ def numpy_to_sitk(image, spacing, origin=None, vector=False):
     """
     """
 
+    # check endianness of data - some sitk operations seem to
+    # only work with little endian
+    if str(image.dtype)[0] == '>':
+        error = "Array cannot be big endian. Convert arrays with ndarray.astype\n"
+        error += "Given array dtype is " + str(image.dtype)
+        raise TypeError(error)
+
     image = sitk.GetImageFromArray(image.copy(), isVector=vector)
     image.SetSpacing(spacing[::-1])
     if origin is None:

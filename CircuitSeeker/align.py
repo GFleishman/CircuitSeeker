@@ -1,4 +1,4 @@
-import os, sys, psutil
+import os, sys, psutil, time
 import numpy as np
 import dask.array as da
 import SimpleITK as sitk
@@ -193,6 +193,192 @@ def configure_irm(
     return irm
 
 
+def random_affine_search(
+    fix,
+    mov,
+    fix_spacing,
+    mov_spacing,
+    max_translation,
+    max_rotation,
+    max_scale,
+    max_shear,
+    max_iterations,
+    affine_align_best=0,
+    alignment_spacing=None,
+    fix_mask=None,
+    mov_mask=None,
+    fix_origin=None,
+    mov_origin=None,
+    **kwargs,
+):
+    """
+    Apply random affine matrices within given bounds to moving image. The best
+    scoring affines can be further refined with gradient descent based affine
+    alignment. The single best result is returned. This function is intended
+    to find good initialization for a full affine alignment obtained by calling
+    `affine_align`
+
+    Parameters
+    ----------
+    fix : ndarray
+        the fixed image
+
+    mov : ndarray
+        the moving image; `fix.ndim` must equal `mov.ndim`
+
+    fix_spacing : 1d array
+        The spacing in physical units (e.g. mm or um) between voxels
+        of the fixed image.
+        Length must equal `fix.ndim`
+
+    mov_spacing : 1d array
+        The spacing in physical units (e.g. mm or um) between voxels
+        of the moving image.
+        Length must equal `mov.ndim`
+
+    max_translation : float
+        The maximum amplitude translation allowed in random sampling.
+        Specified in physical units (e.g. um or mm)
+
+    max_rotation : float
+        The maximum amplitude rotation allowed in random sampling.
+        Specified in radians
+
+    max_scale : float
+        The maximum amplitude scaling allowed in random sampling.
+
+    max_shear : float
+        The maximum amplitude shearing allowed in random sampling.
+
+    max_iterations : int
+        The number of random affine matrices to sample
+
+    affine_align_best : int (default: 0)
+        The best `affine_align_best` random affine matrices are refined
+        by calling `affine_align` setting the random affine as the
+        `initial_transform`. This is parameterized through **kwargs.
+
+    alignment_spacing : float (default: None)
+        Fixed and moving images are skip sampled to a voxel spacing
+        as close as possible to this value. Intended for very fast
+        simple alignments (e.g. low amplitude motion correction)
+
+    fix_mask : binary ndarray (default: None)
+        A mask limiting metric evaluation region of the fixed image
+
+    mov_mask : binary ndarray (default: None)
+        A mask limiting metric evaluation region of the moving image
+
+    fix_origin : 1d array (default: None)
+        Origin of the fixed image.
+        Length must equal `fix.ndim`
+
+    mov_origin : 1d array (default: None)
+        Origin of the moving image.
+        Length must equal `mov.ndim`
+
+    **kwargs : any additional arguments
+        Passed to `configure_irm` to score random affines
+        Also passed to `affine_align` for gradient descent
+        based refinement
+
+    Returns
+    -------
+    transform : 4x4 array
+        The (refined) random affine matrix best initializing a match of
+        the moving image to the fixed. Should be further refined by calling
+        `affine_align`.
+    """
+
+    # define conversion from params to affine transform
+    def params_to_affine_transform(params):
+        aff = sitk.AffineTransform(3)
+        aff.Translate(params[:3])
+        aff.Rotate(0, 1, params[3])
+        aff.Rotate(0, 2, params[4])
+        aff.Rotate(1, 2, params[5])
+        aff.Scale(params[6:9])
+        aff.Shear(0, 1, params[9])
+        aff.Shear(0, 2, params[10])
+        aff.Shear(1, 2, params[11])
+        return aff
+
+    # generate random parameters, first row is always identity
+    params = np.zeros((max_iterations+1, 12))
+    params[:, 6:9] = 1  # default for scale params
+    F = lambda mx: 2 * mx * np.random.rand(max_iterations, 3) - mx
+    if max_translation != 0: params[1:, 0:3] = F(max_translation)
+    if max_rotation != 0: params[1:, 3:6] = F(max_rotation)
+    if max_scale != 0: params[1:, 6:9] = np.e**F(np.log(max_scale))
+    if max_shear != 0: params[1:, 9:] = F(max_shear)
+
+    # set up registration object
+    irm = configure_irm(**kwargs)
+
+    # skip sample to alignment spacing
+    if alignment_spacing is not None:
+        fix, fix_spacing_ss = ut.skip_sample(fix, fix_spacing, alignment_spacing)
+        mov, mov_spacing_ss = ut.skip_sample(mov, mov_spacing, alignment_spacing)
+        if fix_mask is not None:
+            fix_mask, _ = ut.skip_sample(fix_mask, fix_spacing, alignment_spacing)
+        if mov_mask is not None:
+            mov_mask, _ = ut.skip_sample(mov_mask, mov_spacing, alignment_spacing)
+        fix_spacing = fix_spacing_ss
+        mov_spacing = mov_spacing_ss
+
+    # convert to float32 sitk images
+    fix_sitk = ut.numpy_to_sitk(fix, fix_spacing, origin=fix_origin)
+    mov_sitk = ut.numpy_to_sitk(mov, mov_spacing, origin=mov_origin)
+    fix_sitk = sitk.Cast(fix_sitk, sitk.sitkFloat32)
+    mov_sitk = sitk.Cast(mov_sitk, sitk.sitkFloat32)
+
+    # set masks
+    if fix_mask is not None:
+        fix_mask = ut.numpy_to_sitk(fix_mask, fix_spacing, origin=fix_origin)
+        irm.SetMetricFixedMask(fix_mask)
+    if mov_mask is not None:
+        mov_mask = ut.numpy_to_sitk(mov_mask, mov_spacing, origin=mov_origin)
+        irm.SetMetricMovingMask(mov_mask)
+
+    # score all random affines
+    scores = np.empty(max_iterations + 1)
+    for iii, ppp in enumerate(params):
+        aff = params_to_affine_transform(ppp)
+        irm.SetMovingInitialTransform(aff)
+        scores[iii] = irm.MetricEvaluate(fix_sitk, mov_sitk)
+
+    # sort
+    params = params[np.argsort(scores)]
+
+    # gradient descent based refinements
+    if affine_align_best == 0:
+        aff = params_to_affine_transform(params[0])
+        return ut.affine_transform_to_matrix(aff)
+    else:
+
+        # container to hold the scores
+        scores = np.empty(affine_align_best)
+        for iii in range(affine_align_best):
+            aff = params_to_affine_transform(params[iii])
+            aff = ut.affine_transform_to_matrix(aff)
+            aff = affine_align(
+               fix, mov, fix_spacing, mov_spacing,
+               initial_transform=aff,
+               fix_mask=fix_mask,
+               mov_mask=mov_mask,
+               fix_origin=fix_origin,
+               mov_origin=mov_origin,
+               **kwargs,
+            )
+            aff = ut.matrix_to_affine_transform(aff)
+            irm.SetMovingInitialTransform(aff)
+            scores[iii] = irm.MetricEvaluate(fix_sitk, mov_sitk)
+
+        # return the best one
+        aff = params_to_affine_transform(params[np.argmin(scores)])
+        return ut.affine_transform_to_matrix(aff)
+        
+
 def affine_align(
     fix,
     mov,
@@ -207,7 +393,6 @@ def affine_align(
     fix_origin=None,
     mov_origin=None,
     default=np.eye(4),
-    foreground_percentage_threshold=0.2,
     **kwargs,
 ):
     """
@@ -266,11 +451,6 @@ def affine_align(
     default : 4x4 array (default: identity matrix)
         If the optimization fails, print error message but return this value
 
-    foreground_percentage_value : float in [0., 1.]
-        If masks are given, at least `foreground_percentage_value` percent
-        voxels must be in the foreground. Otherwise `default` is returned.
-        Useful for distributed workflows where some times are mostly background.
-
     **kwargs : any additional arguments
         Passed to `configure_irm`
         This is where you would set things like:
@@ -286,22 +466,6 @@ def affine_align(
     if initial_transform is not None and np.all(default == np.eye(4)):
         default = initial_transform
 
-    # if using masks, ensure there is sufficient foreground
-    if fix_mask is not None:
-        foreground_percentage = np.sum(fix_mask) / np.prod(fix_mask.shape)
-        if foreground_percentage < foreground_percentage_threshold:
-            print("Too little foreground data in fixed image")
-            print("Returning default")
-            sys.stdout.flush()
-            return default
-    if mov_mask is not None:
-        foreground_percentage = np.sum(mov_mask) / np.prod(mov_mask.shape)
-        if foreground_percentage < foreground_percentage_threshold:
-            print("Too little foreground data in moving image")
-            print("Returning default")
-            sys.stdout.flush()
-            return default
-
     # skip sample to alignment spacing
     if alignment_spacing is not None:
         fix, fix_spacing_ss = ut.skip_sample(fix, fix_spacing, alignment_spacing)
@@ -313,9 +477,11 @@ def affine_align(
         fix_spacing = fix_spacing_ss
         mov_spacing = mov_spacing_ss
 
-    # convert to sitk images
+    # convert to float32 sitk images
     fix = ut.numpy_to_sitk(fix, fix_spacing, origin=fix_origin)
     mov = ut.numpy_to_sitk(mov, mov_spacing, origin=mov_origin)
+    fix = sitk.Cast(fix, sitk.sitkFloat32)
+    mov = sitk.Cast(mov, sitk.sitkFloat32)
 
     # set up registration object
     irm = configure_irm(**kwargs)
@@ -347,26 +513,26 @@ def affine_align(
         mov_mask = ut.numpy_to_sitk(mov_mask, mov_spacing, origin=mov_origin)
         irm.SetMetricMovingMask(mov_mask)
 
-    # execute alignment
-    irm.Execute(
-        sitk.Cast(fix, sitk.sitkFloat32),
-        sitk.Cast(mov, sitk.sitkFloat32),
-    )
+    # get initial metric value
+    initial_metric_value = irm.MetricEvaluate(fix, mov)
+
+    # execute alignment, catch exceptions and return default
+    try:
+        irm.Execute(fix, mov)
+    except Exception as e:
+        print("Registration failed due to ITK exception printed below")
+        print("Returning default")
+        print(e)
+        sys.stdout.flush()
+        return default
 
     # if centered, convert back to Euler3DTransform object
     if rigid and initialize_with_centering:
         transform = sitk.Euler3DTransform(transform)
 
-    # get initial and final metric values
-    initial_metric_value = irm.MetricEvaluate(
-        sitk.Cast(fix, sitk.sitkFloat32),
-        sitk.Cast(mov, sitk.sitkFloat32),
-    )
-    final_metric_value = irm.GetMetricValue()
-
     # if registration improved metric return result
     # otherwise return default
-    if final_metric_value < initial_metric_value:
+    if irm.MetricEvaluate(fix, mov) < initial_metric_value:
         sys.stdout.flush()
         return ut.affine_transform_to_matrix(transform)
     else:
@@ -426,6 +592,9 @@ def distributed_piecewise_affine_align(
 
     mov_mask : binary ndarray (default: None)
         A mask limiting metric evaluation region of the moving image
+        Due to the distribution aspect, if a mov_mask is provided
+        you must also provide a fix_mask. A reasonable choice if
+        no fix_mask exists is an array of all ones.
 
     cluster_kwargs : dict (default: {})
         Arguments passed to ClusterWrap.cluster
@@ -501,8 +670,13 @@ def distributed_piecewise_affine_align(
         else:
             mm_da = None
 
+        # TODO: LET RIGID BE A FLAG
+        #       LET STITCHING BE A FLAG
+        #       ALLOW USER TO PROVIDE INITIAL MATRIX FOR EACH BLOCK
+        #       PROVIDE ORIGIN TO ALIGNMENT, DON'T DO IT MANUALLY
+
         # closure for affine alignment
-        def single_affine_align(fix, mov, fm, mm, block_info=None):
+        def single_affine_align(fix, mov, fm=None, mm=None, block_info=None):
             # rigid alignment
             rigid = affine_align(
                 fix, mov, fix_spacing, mov_spacing,
@@ -517,6 +691,7 @@ def distributed_piecewise_affine_align(
                 initial_transform=rigid,
                 **kwargs,
             )
+
             # correct for block origin
             idx = block_info[0]['chunk-location']
             origin = np.maximum(0, blocksize * idx - overlaps)
@@ -527,10 +702,15 @@ def distributed_piecewise_affine_align(
             # return result
             return affine.reshape((1,1,1,4,4))
 
+        # determine variadic arguments
+        arrays = [fix_da, mov_da]
+        if fm_da is not None: arrays.append(fm_da)
+        if mm_da is not None: arrays.append(mm_da)
+
         # affine align all chunks
         affines = da.map_overlap(
             single_affine_align,
-            fix_da, mov_da, fm_da, mm_da,
+            *arrays,
             depth=tuple(overlaps),
             dtype=np.float32,
             boundary='none',
@@ -706,7 +886,7 @@ def distributed_twist_align(
     counter = 0
 
     # initialize container and create working copies of image data
-    deform = np.zeros(fix.shape + (3,) dtype=np.float32)
+    deform = np.zeros(fix.shape + (3,), dtype=np.float32)
     current_moving = np.copy(mov)
     current_moving_mask = None if mov_mask is None else np.copy(mov_mask)
 
@@ -743,46 +923,54 @@ def distributed_twist_align(
             set_nested_kwarg(shrink_factors, 'shrink_factors', int)
             set_nested_kwarg(smooth_sigmas, 'smooth_sigmas', float)
 
+            # wait five seconds - this prevents race conditions
+            # with scatter. See issue:
+            # https://github.com/dask/distributed/issues/4612
+            time.sleep(30)
+
             # align
             ddd += distributed_piecewise_affine_align(
                 fix, current_moving,
                 fix_spacing, mov_spacing,
                 nblocks=nblocks,
                 fix_mask=fix_mask,
-                mov_mask=mov_mask,
+                mov_mask=current_moving_mask,
                 cluster_kwargs=cluster_kwargs,
                 **kwargs,
             )[1]  # only want the field
+
+            # increment counter
+            counter += 1
 
         # take mean
         ddd = ddd / len(inner_list)
 
         # compose with existing deform (unless first outer iteration)
         # TODO: add field composition to transform module
+        ppp = np.ceil(np.max(np.linalg.norm(ddd, axis=-1)) / fix_spacing).astype(int)
         if outer_level > 0:
             for iii in range(3):
-                ppp = int(np.ceil(np.max(np.abs(ddd[..., iii])) / fix_spacing[iii]))
-                padded = np.pad(deform[..., iii], [(ppp, ppp),]*3, mode='edge')
+                padded = np.pad(deform[..., iii], [(ppp[iii], ppp[iii]),]*3, mode='edge')
                 deform[..., iii] = apply_transform(
                     deform[..., iii], padded, fix_spacing, fix_spacing,
                     transform_list=[ddd,],
-                    mov_origin=fix_spacing * -ppp,
+                    mov_origin=fix_spacing * -ppp[iii],
                 )
         deform = deform + ddd
 
-        # update working copies
+        # update working copy of image
         current_moving = apply_transform(
             fix, mov, fix_spacing, mov_spacing,
             transform_list=[deform,],
         )
-        current_mask = apply_transform(
-            fix, mov_mask, fix_spacing, mov_spacing,
-            transform_list=[deform,],
-        )
-        current_mask = (current_mask > 0).astype(bool)
 
-        # increment counter
-        counter += 1
+        # update working copy of mask
+        if mov_mask is not None:
+            current_moving_mask = apply_transform(
+                fix, mov_mask, fix_spacing, mov_spacing,
+                transform_list=[deform,],
+            )
+            current_moving_mask = (current_moving_mask > 0).astype(np.uint8)
 
         # write intermediates
         if intermediates_path is not None:
@@ -792,7 +980,8 @@ def distributed_twist_align(
             mask_path = (intermediates_path + '/twisted_mask_o{}_i{}.npy').format(ois, iis)
             np.save(deform_path, deform)
             np.save(image_path, current_moving)
-            np.save(mask_path, current_mask)
+            if mov_mask is not None:
+                np.save(mask_path, current_moving_mask)
 
     # return deform
     return deform

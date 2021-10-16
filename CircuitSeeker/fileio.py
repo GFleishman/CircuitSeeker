@@ -25,6 +25,20 @@ def testPathExtensionForHDF5(image_path):
         return ext in hdf5_extensions
 
 
+def testPathExtensionForSTACK(image_path):
+    """
+    Returns true if `image_path` has a stack extension
+    Currently: ['.stack']
+    """
+
+    stack_extensions = ['.stack',]
+    if image_path in stack_extensions:
+        return True
+    else:
+        ext = path.splitext(image_path)[-1]
+        return ext in stack_extensions
+
+
 def globPaths(folder, prefix, suffix):
     """
     Returns sorted list of all absolue paths matching `folder/prefix*suffix`
@@ -69,14 +83,43 @@ def daskArrayBackedByHDF5(folder, prefix, suffix, dataset_path, stride=None):
     return da.stack(arrays, axis=0)
 
 
+def daskArrayBackedBySTACK(folder, prefix, suffix, dtype, shape, stride=None):
+    """
+    Returns dask.array backed by raw STACK files matching absolute path
+    `folder/prefix*suffix`.
+    """
+
+    error_message = "daskArrayBackedBySTACK requires stack files with .stack extension"
+    assert (testPathExtensionForSTACK(suffix)), error_message
+    images = globPaths(folder, prefix, suffix)
+    if stride is not None:
+        images = images[::stride]
+
+    readSTACK_d = lambda img: da.from_delayed(
+        delayed(readSTACK)(img, dtype, shape), shape, dtype,
+    )
+    arrays = [readSTACK_d(image) for image in images]
+    return da.stack(arrays, axis=0)
+
+
 def readHDF5(image_path, dataset_path):
     """
-    Returns (lazy) h5py array to dataset at `image_path[dataset_path]`
+    Returns array to dataset at `image_path[dataset_path]`
     """
 
     error_message = "readHDF5 requires hdf5 files with .h5 or .hdf5 extension"
     assert (testPathExtensionForHDF5(image_path)), error_message
     return h5py.File(image_path, 'r')[dataset_path][:]
+
+
+def readSTACK(image_path, dtype, shape):
+    """
+    Returns array to dataset at image_path with given data type and shape
+    """
+
+    error_message = "readSTACK required stack files with .stack extension"
+    assert (testPathExtensionForSTACK(image_path)), error_message
+    return np.fromfile(image_path, dtype=dtype).reshape(shape)
 
 
 def readImage(image_path, dataset_path=None):
