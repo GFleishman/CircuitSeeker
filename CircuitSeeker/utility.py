@@ -142,10 +142,8 @@ def bspline_to_displacement_field(reference, bspline):
 def check_cluster(func):
     @functools.wraps(func)
     def create_or_pass_cluster(*args, **kwargs):
-        assert('cluster' in kwargs, 'cluster has to be in kwargs of the function')
-        assert('cluster_kwargs' in kwargs, 'cluster_kwargs has to be in kwargs of the function')
-        cluster = kwargs.pop['cluster']
-        cluster_kwargs = kwargs.pop['cluster_kwargs']
+        cluster = kwargs.pop('cluster')
+        cluster_kwargs = kwargs.pop('cluster_kwargs')
         if cluster is None:
             with ClusterWrap.cluster(**cluster_kwargs) as cluster:
                 return func(*args, **kwargs, cluster=cluster)
