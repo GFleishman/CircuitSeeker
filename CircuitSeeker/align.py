@@ -2,7 +2,6 @@ import os, sys, psutil, time
 import numpy as np
 import dask.array as da
 import SimpleITK as sitk
-import ClusterWrap
 import CircuitSeeker.utility as ut
 from CircuitSeeker.transform import apply_transform
 import greedypy.greedypy_registration_method as grm
@@ -541,7 +540,7 @@ def affine_align(
         sys.stdout.flush()
         return default
 
-
+@ut.check_cluster
 def distributed_piecewise_affine_align(
     fix,
     mov,
@@ -551,6 +550,8 @@ def distributed_piecewise_affine_align(
     overlap=0.5,
     fix_mask=None,
     mov_mask=None,
+    *,
+    cluster=None,
     cluster_kwargs={},
     **kwargs,
 ):
@@ -623,114 +624,101 @@ def distributed_piecewise_affine_align(
     blocksize = np.ceil(blocksize).astype(np.int16)
     overlaps = np.round(blocksize * overlap).astype(np.int16)
 
-    # set up cluster
-    with ClusterWrap.cluster(**cluster_kwargs) as cluster:
 
-        # pad the ends to fill in the last blocks
-        # blocks must all be exact for stitch to work correctly
-        pads = [(0, y - x % y) if x % y > 0
-            else (0, 0) for x, y in zip(fix.shape, blocksize)]
-        fix_p = np.pad(fix, pads)
-        mov_p = np.pad(mov, pads)
+    # pad the ends to fill in the last blocks
+    # blocks must all be exact for stitch to work correctly
+    pads = [(0, y - x % y) if x % y > 0
+        else (0, 0) for x, y in zip(fix.shape, blocksize)]
+    fix_p = np.pad(fix, pads)
+    mov_p = np.pad(mov, pads)
 
-        # pad masks if necessary
-        if fix_mask is not None:
-            fm_p = np.pad(fix_mask, pads)
-        if mov_mask is not None:
-            mm_p = np.pad(mov_mask, pads)
+    # pad masks if necessary
+    if fix_mask is not None:
+        fm_p = np.pad(fix_mask, pads)
+    if mov_mask is not None:
+        mm_p = np.pad(mov_mask, pads)
 
-        # CONSTRUCT DASK ARRAY VERSION OF OBJECTS
-        # fix
-        fix_future = cluster.client.scatter(fix_p)
-        fix_da = da.from_delayed(
-            fix_future, shape=fix_p.shape, dtype=fix_p.dtype
-        ).rechunk(tuple(blocksize))
+    # CONSTRUCT DASK ARRAY VERSION OF OBJECTS OR SKIP IF ALREADY DASK ARRAYS
+    # fix
+    fix_da = ut.scatter_dask_array(cluster, fix_p).rechunk(tuple(blocksize))
 
-        # mov
-        mov_future = cluster.client.scatter(mov_p)
-        mov_da = da.from_delayed(
-            mov_future, shape=mov_p.shape, dtype=mov_p.dtype
-        ).rechunk(tuple(blocksize))
+    # mov
+    mov_da = ut.scatter_dask_array(cluster, mov_p).rechunk(tuple(blocksize))
 
-        # fix mask
-        if fix_mask is not None:
-            fm_future = cluster.client.scatter(fm_p)
-            fm_da = da.from_delayed(
-                fm_future, shape=fm_p.shape, dtype=fm_p.dtype
-            ).rechunk(tuple(blocksize))
-        else:
-            fm_da = None
+    # fix mask
+    if fix_mask is not None:
+        fm_da = ut.scatter_dask_array(cluster, fm_p).rechunk(tuple(blocksize))
+    else:
+        fm_da = None
 
-        # mov mask
-        if mov_mask is not None:
-            mm_future = cluster.client.scatter(mm_p)
-            mm_da = da.from_delayed(
-                mm_future, shape=mm_p.shape, dtype=mm_p.dtype
-            ).rechunk(tuple(blocksize))
-        else:
-            mm_da = None
+    # mov mask
+    if mov_mask is not None:
+        mm_da = ut.scatter_dask_array(cluster, mm_p).rechunk(tuple(blocksize))
+    else:
+        mm_da = None
 
-        # TODO: LET RIGID BE A FLAG
-        #       LET STITCHING BE A FLAG
-        #       ALLOW USER TO PROVIDE INITIAL MATRIX FOR EACH BLOCK
-        #       PROVIDE ORIGIN TO ALIGNMENT, DON'T DO IT MANUALLY
+    # TODO: LET RIGID BE A FLAG
+    #       LET STITCHING BE A FLAG
+    #       ALLOW USER TO PROVIDE INITIAL MATRIX FOR EACH BLOCK
+    #       PROVIDE ORIGIN TO ALIGNMENT, DON'T DO IT MANUALLY
 
-        # closure for affine alignment
-        def single_affine_align(fix, mov, fm=None, mm=None, block_info=None):
-            # rigid alignment
-            rigid = affine_align(
-                fix, mov, fix_spacing, mov_spacing,
-                fix_mask=fm, mov_mask=mm,
-                rigid=True,
-                **kwargs,
-            )
-            # affine alignment
-            affine = affine_align(
-                fix, mov, fix_spacing, mov_spacing,
-                fix_mask=fm, mov_mask=mm,
-                initial_transform=rigid,
-                **kwargs,
-            )
+    # closure for affine alignment
+    def single_affine_align(fix, mov, fm=None, mm=None, block_info=None):
+        # rigid alignment
+        rigid = affine_align(
+            fix, mov, fix_spacing, mov_spacing,
+            fix_mask=fm, mov_mask=mm,
+            rigid=True,
+            **kwargs,
+        )
+        # affine alignment
+        affine = affine_align(
+            fix, mov, fix_spacing, mov_spacing,
+            fix_mask=fm, mov_mask=mm,
+            initial_transform=rigid,
+            **kwargs,
+        )
 
-            # correct for block origin
-            idx = block_info[0]['chunk-location']
-            origin = np.maximum(0, blocksize * idx - overlaps)
-            origin = origin * fix_spacing
-            tl, tr = np.eye(4), np.eye(4)
-            tl[:3, -1], tr[:3, -1] = origin, -origin
-            affine = np.matmul(tl, np.matmul(affine, tr))
-            # return result
-            return affine.reshape((1,1,1,4,4))
+        # correct for block origin
+        idx = block_info[0]['chunk-location']
+        origin = np.maximum(0, blocksize * idx - overlaps)
+        origin = origin * fix_spacing
+        tl, tr = np.eye(4), np.eye(4)
+        tl[:3, -1], tr[:3, -1] = origin, -origin
+        affine = np.matmul(tl, np.matmul(affine, tr))
+        # return result
+        return affine.reshape((1,1,1,4,4))
 
-        # determine variadic arguments
-        arrays = [fix_da, mov_da]
-        if fm_da is not None: arrays.append(fm_da)
-        if mm_da is not None: arrays.append(mm_da)
+    # determine variadic arguments
+    arrays = [fix_da, mov_da]
+    if fm_da is not None: arrays.append(fm_da)
+    if mm_da is not None: arrays.append(mm_da)
 
-        # affine align all chunks
-        affines = da.map_overlap(
-            single_affine_align,
-            *arrays,
-            depth=tuple(overlaps),
-            dtype=np.float32,
-            boundary='none',
-            trim=False,
-            align_arrays=False,
-            new_axis=[3,4],
-            chunks=[1,1,1,4,4],
-        ).compute()
+    # affine align all chunks
+    affines = da.map_overlap(
+        single_affine_align,
+        *arrays,
+        depth=tuple(overlaps),
+        dtype=np.float32,
+        boundary='none',
+        trim=False,
+        align_arrays=False,
+        new_axis=[3,4],
+        chunks=[1,1,1,4,4],
+    ).compute()
 
-        # TODO: interface may change here
-        # stitch local affines into displacement field
-        field = local_affines_to_field(
-            fix.shape, fix_spacing,
-            affines, blocksize, overlaps,
-        ).compute()
+    # TODO: interface may change here
+    # stitch local affines into displacement field
+    field = local_affines_to_field(
+        fix.shape, fix_spacing,
+        affines, blocksize, overlaps,
+    ).compute()
 
-        # return both formats
-        return affines, field
+    # return both formats
+    return affines, field
 
 
+@ut.check_cluster
 def distributed_twist_align(
     fix,
     mov,
@@ -746,6 +734,8 @@ def distributed_twist_align(
     shrink_factors=[2,1],
     smooth_sigmas=[2.,1.],
     intermediates_path=None,
+    *,
+    cluster=None,
     cluster_kwargs={},
     **kwargs,
 ):
@@ -864,6 +854,10 @@ def distributed_twist_align(
         The deform, transformed moving image, and transformed
         moving image mask (if given) are stored on disk as npy files.
     
+    cluster : ClusterWrap.cluster (default: None)
+        If a cluster is persistent beoned this function it should be passed
+        here without passing cluster_kwargs
+
     cluster_kwargs : dict (default: {})
         Arguments passed to ClusterWrap.cluster
         If working with an LSF cluster, this will be
@@ -935,6 +929,7 @@ def distributed_twist_align(
                 nblocks=nblocks,
                 fix_mask=fix_mask,
                 mov_mask=current_moving_mask,
+                cluster=cluster,
                 cluster_kwargs=cluster_kwargs,
                 **kwargs,
             )[1]  # only want the field
@@ -1100,6 +1095,7 @@ def exhaustive_translation(
     return trans
 
 
+@ut.check_cluster
 def distributed_piecewise_exhaustive_translation(
     fix,
     mov,
@@ -1111,6 +1107,8 @@ def distributed_piecewise_exhaustive_translation(
     step_sizes,
     smooth_sigma,
     mask=None,
+    *,
+    cluster=None,
     cluster_kwargs={},
     **kwargs,
 ):
@@ -1218,44 +1216,34 @@ def distributed_piecewise_exhaustive_translation(
     mov_origin = np.array(search_radius) - query_radius
     mov_origin = mov_origin * fix_spacing
 
-    # set up cluster
-    with ClusterWrap.cluster(**cluster_kwargs) as cluster:
+    # fix
+    fix_blocks_da = ut.scatter_dask_array(cluster, fix_blocks
+    ).rechunk((1,)+fix_blocks.shape[1:])
 
-        # fix
-        fix_blocks_future = cluster.client.scatter(fix_blocks)
-        fix_blocks_da = da.from_delayed(
-            fix_blocks_future,
-            shape=fix_blocks.shape,
-            dtype=fix_blocks.dtype
-        ).rechunk((1,)+fix_blocks.shape[1:])
+    # mov
+    mov_blocks_da = ut.scatter_dask_array(cluster, mov_blocks
+    ).rechunk((1,)+mov_blocks.shape[1:])
+    
 
-        # mov
-        mov_blocks_future = cluster.client.scatter(mov_blocks)
-        mov_blocks_da = da.from_delayed(
-            mov_blocks_future,
-            shape=mov_blocks.shape,
-            dtype=mov_blocks.dtype
-        ).rechunk((1,)+mov_blocks.shape[1:])
+    # closure for exhaustive translation alignment
+    def wrapped_exhaustive_translation(x, y):
+        t = exhaustive_translation(
+            x.squeeze(), y.squeeze(),
+            fix_spacing, mov_spacing,
+            num_steps, step_sizes,
+            mov_origin=mov_origin,
+            **kwargs,
+        )
+        return np.array(t).reshape((1, 3))
 
-        # closure for exhaustive translation alignment
-        def wrapped_exhaustive_translation(x, y):
-            t = exhaustive_translation(
-                x.squeeze(), y.squeeze(),
-                fix_spacing, mov_spacing,
-                num_steps, step_sizes,
-                mov_origin=mov_origin,
-                **kwargs,
-            )
-            return np.array(t).reshape((1, 3))
-
-        # distribute
-        translations = da.map_blocks(
-            wrapped_exhaustive_translation,
-            fix_blocks_da, mov_blocks_da,
-            dtype=np.float64, 
-            drop_axis=[2,3],
-            chunks=[1, 3],
-        ).compute()
+    # distribute
+    translations = da.map_blocks(
+        wrapped_exhaustive_translation,
+        fix_blocks_da, mov_blocks_da,
+        dtype=np.float64, 
+        drop_axis=[2,3],
+        chunks=[1, 3],
+    ).compute()
 
     # reformat to displacement vector field
     dvf = np.zeros(fix.shape + (3,), dtype=np.float32)
@@ -1271,7 +1259,7 @@ def distributed_piecewise_exhaustive_translation(
         dvf_s = np.empty_like(dvf)
         for i in range(3):
             dvf_s[..., i] = gaussian_filter(dvf[..., i], smooth_sigma/fix_spacing)
-        return dvs_s
+        return dvf_s
     else:
         return dvf
 
@@ -1371,6 +1359,7 @@ def deformable_align_greedypy(
     return register.get_warp()
 
 
+@ut.check_cluster
 def distributed_piecewise_deformable_align_greedypy(
     fix,
     mov,
@@ -1379,6 +1368,8 @@ def distributed_piecewise_deformable_align_greedypy(
     nblocks,
     radius,
     overlap=0.5, 
+    *,
+    cluster=None,
     cluster_kwargs={},
     **kwargs,
 ):
@@ -1440,61 +1431,53 @@ def distributed_piecewise_deformable_align_greedypy(
     blocksize = np.ceil(blocksize).astype(np.int16)
     overlaps = np.round(blocksize * overlap).astype(np.int16)
 
-    # set up cluster
-    with ClusterWrap.cluster(**cluster_kwargs) as cluster:
 
-        # pad the ends to fill in the last blocks
-        # blocks must all be exact for stitch to work correctly
-        pads = [(0, y - x % y) if x % y > 0
-            else (0, 0) for x, y in zip(fix.shape, blocksize)]
-        fix_p = np.pad(fix, pads)
-        mov_p = np.pad(mov, pads)
+    # pad the ends to fill in the last blocks
+    # blocks must all be exact for stitch to work correctly
+    pads = [(0, y - x % y) if x % y > 0
+        else (0, 0) for x, y in zip(fix.shape, blocksize)]
+    fix_p = np.pad(fix, pads)
+    mov_p = np.pad(mov, pads)
 
-        # scatter fix data to cluster
-        fix_future = cluster.client.scatter(fix_p)
-        fix_da = da.from_delayed(
-            fix_future, shape=fix_p.shape, dtype=fix_p.dtype
-        ).rechunk(tuple(blocksize))
+    # scatter fix data to cluster
+    fix_da = ut.scatter_dask_array(cluster, fix_p).rechunk(tuple(blocksize))
+  
+    # scatter mov data to cluster
+    mov_da = ut.scatter_dask_array(cluster, mov_p).rechunk(tuple(blocksize))
 
-        # scatter mov data to cluster
-        mov_future = cluster.client.scatter(mov_p)
-        mov_da = da.from_delayed(
-            mov_future, shape=mov_p.shape, dtype=mov_p.dtype
-        ).rechunk(tuple(blocksize))
+    # closure for greedypy_deformable_align
+    def single_deformable_align(fix, mov):
+        return greedypy_deformable_align(
+            fix, mov, fix_spacing, mov_spacing,
+            radius, **kwargs
+        ).reshape((1,)*fix.ndim + fix.shape + (3,))
 
-        # closure for greedypy_deformable_align
-        def single_deformable_align(fix, mov):
-            return greedypy_deformable_align(
-                fix, mov, fix_spacing, mov_spacing,
-                radius, **kwargs
-            ).reshape((1,)*fix.ndim + fix.shape + (3,))
+    # determine output chunk shape
+    output_chunks = tuple(x+2*y for x, y in zip(blocksize, overlaps))
+    output_chunks = (1,)*fix.ndim + output_chunks + (3,)
 
-        # determine output chunk shape
-        output_chunks = tuple(x+2*y for x, y in zip(blocksize, overlaps))
-        output_chunks = (1,)*fix.ndim + output_chunks + (3,)
+    # deform all chunks
+    fields = da.map_overlap(
+        single_deformable_align,
+        fix_da, mov_da,
+        depth=tuple(overlaps),
+        dtype=np.float32,
+        boundary=0,
+        trim=False,
+        align_arrays=False,
+        new_axis=[3,4,5,6],
+        chunks=output_chunks,
+    ).compute()
 
-        # deform all chunks
-        fields = da.map_overlap(
-            single_deformable_align,
-            fix_da, mov_da,
-            depth=tuple(overlaps),
-            dtype=np.float32,
-            boundary=0,
-            trim=False,
-            align_arrays=False,
-            new_axis=[3,4,5,6],
-            chunks=output_chunks,
-        ).compute()
+    # TODO need a stitching function here
+    # stitch local fields
+    field = stitch_fields(
+        fix.shape, fix_spacing,
+        affines, blocksize, overlaps,
+    ).compute()
 
-        # TODO need a stitching function here
-        # stitch local fields
-        field = stitch_fields(
-            fix.shape, fix_spacing,
-            affines, blocksize, overlaps,
-        ).compute()
-
-        # return
-        return field
+    # return
+    return field
             
 
 def bspline_deformable_align(
