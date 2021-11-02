@@ -710,7 +710,7 @@ def distributed_piecewise_affine_align(
     # TODO: interface may change here
     # stitch local affines into displacement field
     field = local_affines_to_field(
-        fix.shape, fix_spacing,
+        fix.shape, np.asarray(fix_spacing),
         affines, blocksize, overlaps,
     ).compute()
 
