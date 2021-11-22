@@ -10,7 +10,7 @@ def apply_transform(
     transform_spacing=None,
     fix_origin=None,
     mov_origin=None,
-    ):
+):
     """
     """
 
@@ -20,10 +20,6 @@ def apply_transform(
     else:
         ncores = psutil.cpu_count(logical=False)
     sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(2*ncores)
-
-    # set up resampler
-    resampler = sitk.ResampleImageFilter()
-    resampler.SetNumberOfThreads(2*ncores)
 
     # convert images to sitk objects
     dtype = fix.dtype
@@ -58,9 +54,9 @@ def apply_transform(
         transform.AddTransform(t)
 
     # set up resampler object
+    resampler = sitk.ResampleImageFilter()
+    resampler.SetNumberOfThreads(2*ncores)
     resampler.SetReferenceImage(sitk.Cast(fix, sitk.sitkFloat32))
-    resampler.SetInterpolator(sitk.sitkLinear)
-    resampler.SetDefaultPixelValue(0)
     resampler.SetTransform(transform)
 
     # execute, return as numpy array

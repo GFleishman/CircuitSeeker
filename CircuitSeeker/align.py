@@ -5,8 +5,10 @@ import SimpleITK as sitk
 import ClusterWrap
 import CircuitSeeker.utility as ut
 from CircuitSeeker.transform import apply_transform
+from CircuitSeeker.quality import jaccard_filter
 import greedypy.greedypy_registration_method as grm
 from scipy.ndimage import minimum_filter, gaussian_filter
+from scipy.spatial.transform import Rotation
 
 # TODO: need to refactor stitching
 from dask_stitch.local_affine import local_affines_to_field
@@ -202,13 +204,14 @@ def random_affine_search(
     max_rotation,
     max_scale,
     max_shear,
-    max_iterations,
+    random_iterations,
     affine_align_best=0,
     alignment_spacing=None,
     fix_mask=None,
     mov_mask=None,
     fix_origin=None,
     mov_origin=None,
+    jaccard_filter_threshold=None,
     **kwargs,
 ):
     """
@@ -250,7 +253,7 @@ def random_affine_search(
     max_shear : float
         The maximum amplitude shearing allowed in random sampling.
 
-    max_iterations : int
+    random_iterations : int
         The number of random affine matrices to sample
 
     affine_align_best : int (default: 0)
@@ -277,6 +280,13 @@ def random_affine_search(
         Origin of the moving image.
         Length must equal `mov.ndim`
 
+    jaccard_filter_threshold : float in range [0, 1] (default: None)
+        If `jaccard_filter_threshold`, `fix_mask`, and `mov_mask` are all
+        defined (i.e. not None), then the Jaccard index between the masks
+        is computed. If the index is less than this threshold the alignment
+        is skipped and the default is returned. Useful for distributed piecewise
+        workflows over heterogenous data.
+
     **kwargs : any additional arguments
         Passed to `configure_irm` to score random affines
         Also passed to `affine_align` for gradient descent
@@ -290,26 +300,54 @@ def random_affine_search(
         `affine_align`.
     """
 
-    # define conversion from params to affine transform
-    def params_to_affine_transform(params):
-        aff = sitk.AffineTransform(3)
-        aff.Translate(params[:3])
-        aff.Rotate(0, 1, params[3])
-        aff.Rotate(0, 2, params[4])
-        aff.Rotate(1, 2, params[5])
-        aff.Scale(params[6:9])
-        aff.Shear(0, 1, params[9])
-        aff.Shear(0, 2, params[10])
-        aff.Shear(1, 2, params[11])
-        return aff
+    # check jaccard index
+    a = jaccard_filter_threshold is not None
+    b = fix_mask is not None
+    c = mov_mask is not None
+    if a and b and c:
+        if not jaccard_filter(fix_mask, mov_mask, jaccard_filter_threshold):
+            print("Masks failed jaccard_filter")
+            print("Returning default")
+            return np.eye(4)
 
+    # define conversion from params to affine transform
+    def params_to_affine_matrix(params):
+
+        # translation
+        translation = np.eye(4)
+        translation[:3, -1] = params[:3]
+
+        # rotation
+        rotation = np.eye(4)
+        rotation[:3, :3] = Rotation.from_rotvec(params[3:6]).as_matrix()
+        center = np.array(fix.shape) / 2 * fix_spacing
+        tl, tr = np.eye(4), np.eye(4)
+        tl[:3, -1], tr[:3, -1] = center, -center
+        rotation = np.matmul(tl, np.matmul(rotation, tr))
+
+        # scale
+        scale = np.diag( list(params[6:9]) + [1,])
+
+        # shear
+        shx, shy, shz = np.eye(4), np.eye(4), np.eye(4)
+        shx[1, 0], shx[2, 0] = params[10], params[11]
+        shy[0, 1], shy[2, 1] = params[9], params[11]
+        shz[0, 2], shz[1, 2] = params[9], params[10]
+        shear = np.matmul(shz, np.matmul(shy, shx))
+
+        # compose
+        aff = np.matmul(rotation, translation)
+        aff = np.matmul(scale, aff)
+        aff = np.matmul(shear, aff)
+        return aff
+        
     # generate random parameters, first row is always identity
-    params = np.zeros((max_iterations+1, 12))
+    params = np.zeros((random_iterations+1, 12))
     params[:, 6:9] = 1  # default for scale params
-    F = lambda mx: 2 * mx * np.random.rand(max_iterations, 3) - mx
+    F = lambda mx: 2 * mx * np.random.rand(random_iterations, 3) - mx
     if max_translation != 0: params[1:, 0:3] = F(max_translation)
     if max_rotation != 0: params[1:, 3:6] = F(max_rotation)
-    if max_scale != 0: params[1:, 6:9] = np.e**F(np.log(max_scale))
+    if max_scale != 1: params[1:, 6:9] = np.e**F(np.log(max_scale))
     if max_shear != 0: params[1:, 9:] = F(max_shear)
 
     # set up registration object
@@ -334,33 +372,42 @@ def random_affine_search(
 
     # set masks
     if fix_mask is not None:
-        fix_mask = ut.numpy_to_sitk(fix_mask, fix_spacing, origin=fix_origin)
-        irm.SetMetricFixedMask(fix_mask)
+        fix_mask_sitk = ut.numpy_to_sitk(fix_mask, fix_spacing, origin=fix_origin)
+        irm.SetMetricFixedMask(fix_mask_sitk)
     if mov_mask is not None:
-        mov_mask = ut.numpy_to_sitk(mov_mask, mov_spacing, origin=mov_origin)
-        irm.SetMetricMovingMask(mov_mask)
+        mov_mask_sitk = ut.numpy_to_sitk(mov_mask, mov_spacing, origin=mov_origin)
+        irm.SetMetricMovingMask(mov_mask_sitk)
 
     # score all random affines
-    scores = np.empty(max_iterations + 1)
+    scores = np.empty(random_iterations + 1)
+    fail_count = 0  # keep track of failures
     for iii, ppp in enumerate(params):
-        aff = params_to_affine_transform(ppp)
+        aff = params_to_affine_matrix(ppp)
+        aff = ut.matrix_to_affine_transform(aff)
         irm.SetMovingInitialTransform(aff)
-        scores[iii] = irm.MetricEvaluate(fix_sitk, mov_sitk)
+        try:
+            scores[iii] = irm.MetricEvaluate(fix_sitk, mov_sitk)
+        except Exception as e:
+            scores[iii] = np.finfo(scores.dtype).max
+            fail_count += 1
+            if fail_count >= 10 or fail_count >= random_iterations + 1:
+                print("Random search failed due to ITK exception:\n", e)
+                print("Returning default")
+                return np.eye(4)
 
     # sort
     params = params[np.argsort(scores)]
 
     # gradient descent based refinements
     if affine_align_best == 0:
-        aff = params_to_affine_transform(params[0])
-        return ut.affine_transform_to_matrix(aff)
-    else:
+        return params_to_affine_matrix(params[0])
 
+    else:
         # container to hold the scores
         scores = np.empty(affine_align_best)
+        fail_count = 0  # keep track of failures
         for iii in range(affine_align_best):
-            aff = params_to_affine_transform(params[iii])
-            aff = ut.affine_transform_to_matrix(aff)
+            aff = params_to_affine_matrix(params[iii])
             aff = affine_align(
                fix, mov, fix_spacing, mov_spacing,
                initial_transform=aff,
@@ -368,15 +415,23 @@ def random_affine_search(
                mov_mask=mov_mask,
                fix_origin=fix_origin,
                mov_origin=mov_origin,
+               alignment_spacing=None,  # already done in this function
                **kwargs,
             )
             aff = ut.matrix_to_affine_transform(aff)
             irm.SetMovingInitialTransform(aff)
-            scores[iii] = irm.MetricEvaluate(fix_sitk, mov_sitk)
+            try:
+                scores[iii] = irm.MetricEvaluate(fix_sitk, mov_sitk)
+            except Exception as e:
+                scores[iii] = np.finfo(scores.dtype).max
+                fail_count += 1
+                if fail_count >= affine_align_best:
+                    print("Random search failed due to ITK exception:\n", e)
+                    print("Returning default")
+                    return np.eye(4)
 
         # return the best one
-        aff = params_to_affine_transform(params[np.argmin(scores)])
-        return ut.affine_transform_to_matrix(aff)
+        return params_to_affine_matrix(params[np.argmin(scores)])
         
 
 def affine_align(
@@ -392,6 +447,7 @@ def affine_align(
     mov_mask=None,
     fix_origin=None,
     mov_origin=None,
+    jaccard_filter_threshold=None,
     default=np.eye(4),
     **kwargs,
 ):
@@ -448,6 +504,13 @@ def affine_align(
         Origin of the moving image.
         Length must equal `mov.ndim`
 
+    jaccard_filter_threshold : float in range [0, 1] (default: None)
+        If `jaccard_filter_threshold`, `fix_mask`, and `mov_mask` are all
+        defined (i.e. not None), then the Jaccard index between the masks
+        is computed. If the index is less than this threshold the alignment
+        is skipped and the default is returned. Useful for distributed piecewise
+        workflows over heterogenous data.
+
     default : 4x4 array (default: identity matrix)
         If the optimization fails, print error message but return this value
 
@@ -465,6 +528,16 @@ def affine_align(
     # update default if an initial transform is provided
     if initial_transform is not None and np.all(default == np.eye(4)):
         default = initial_transform
+
+    # check jaccard index
+    a = jaccard_filter_threshold is not None
+    b = fix_mask is not None
+    c = mov_mask is not None
+    if a and b and c:
+        if not jaccard_filter(fix_mask, mov_mask, jaccard_filter_threshold):
+            print("Masks failed jaccard_filter")
+            print("Returning default")
+            return default
 
     # skip sample to alignment spacing
     if alignment_spacing is not None:
@@ -513,16 +586,14 @@ def affine_align(
         mov_mask = ut.numpy_to_sitk(mov_mask, mov_spacing, origin=mov_origin)
         irm.SetMetricMovingMask(mov_mask)
 
-    # get initial metric value
-    initial_metric_value = irm.MetricEvaluate(fix, mov)
-
-    # execute alignment, catch exceptions and return default
+    # execute alignment, for any exceptions return default
     try:
+        initial_metric_value = irm.MetricEvaluate(fix, mov)
         irm.Execute(fix, mov)
+        final_metric_value = irm.MetricEvaluate(fix, mov)
     except Exception as e:
-        print("Registration failed due to ITK exception printed below")
-        print("Returning default")
-        print(e)
+        print("Registration failed due to ITK exception:\n", e)
+        print("\nReturning default")
         sys.stdout.flush()
         return default
 
@@ -532,11 +603,13 @@ def affine_align(
 
     # if registration improved metric return result
     # otherwise return default
-    if irm.MetricEvaluate(fix, mov) < initial_metric_value:
+    if final_metric_value < initial_metric_value:
         sys.stdout.flush()
         return ut.affine_transform_to_matrix(transform)
     else:
         print("Optimization failed to improve metric")
+        print("initial value: {}".format(initial_metric_value))
+        print("final value: {}".format(final_metric_value))
         print("Returning default")
         sys.stdout.flush()
         return default
@@ -551,13 +624,18 @@ def distributed_piecewise_affine_align(
     overlap=0.5,
     fix_mask=None,
     mov_mask=None,
+    steps=['rigid', 'affine'],
+    random_kwargs={},
+    rigid_kwargs={},
+    affine_kwargs={},
     cluster_kwargs={},
     **kwargs,
 ):
     """
-    Piecewise rigid + affine alignment of moving to fixed image.
+    Piecewise affine alignment of moving to fixed image.
     Overlapping blocks are given to `affine_align` in parallel
-    on distributed hardware.
+    on distributed hardware. Can include random initialization,
+    rigid alignment, and affine alignment.
 
     Parameters
     ----------
@@ -596,6 +674,42 @@ def distributed_piecewise_affine_align(
         you must also provide a fix_mask. A reasonable choice if
         no fix_mask exists is an array of all ones.
 
+    steps : list of type string (default: ['rigid', 'affine'])
+        Flags to indicate which steps to run. An empty list will guarantee
+        all affines are the identity. Any of the following may be in the list:
+            'random': run `random_affine_search` first
+            'rigid': run `affine_align` with rigid=True
+            'affine': run `affine_align` with rigid=False
+        If all steps are present they are run in the order given above.
+        Steps share parameters given to kwargs. Parameters for individual
+        steps override general settings with `random_kwargs`, `rigid_kwargs`,
+        and `affine_kwargs`. If `random` is in the list, `random_kwargs`
+        must be defined.
+
+    random_kwargs : dict (default: {})
+        Keyword arguments to pass to `random_affine_search`. This is only
+        necessary if 'random' is in `steps`. If so, the following keys must
+        be given:
+                'max_translation'
+                'max_rotation'
+                'max_scale'
+                'max_shear'
+                'random_iterations'
+        However any argument to `random_affine_search` may be defined. See
+        documentation for `random_affine_search` for descriptions of these
+        parameters. If 'random' and 'rigid' are both in `steps` then
+        'max_scale' and 'max_shear' must both be 0.
+
+    rigid_kwargs : dict (default: {})
+        If 'rigid' is in `steps`, these keyword arguments are passed
+        to `affine_align` during the rigid=True step. They override
+        any common general kwargs.
+
+    affine_kwargs : dict (default: {})
+        If 'affine' is in `steps`, these keyword arguments are passed
+        to `affine_align` during the rigid=False (affine) step. They
+        override any common general kwargs.
+
     cluster_kwargs : dict (default: {})
         Arguments passed to ClusterWrap.cluster
         If working with an LSF cluster, this will be
@@ -604,7 +718,7 @@ def distributed_piecewise_affine_align(
         This is how distribution parameters are specified.
 
     kwargs : any additional arguments
-        Passed to `affine_align` for every block
+        Passed to calls `random_affine_search` and `affine_align` calls
 
     Returns
     -------
@@ -621,10 +735,15 @@ def distributed_piecewise_affine_align(
     # compute block size and overlaps
     blocksize = np.array(fix.shape).astype(np.float32) / nblocks
     blocksize = np.ceil(blocksize).astype(np.int16)
-    overlaps = np.round(blocksize * overlap).astype(np.int16)
+    overlaps = tuple(np.round(blocksize * overlap).astype(np.int16))
 
     # set up cluster
     with ClusterWrap.cluster(**cluster_kwargs) as cluster:
+
+        # XXX EXPERIMENTAL
+        while ((cluster.client.status == "running") and
+               (len(cluster.client.scheduler_info()["workers"]) < 1)):
+            time.sleep(1.0)
 
         # pad the ends to fill in the last blocks
         # blocks must all be exact for stitch to work correctly
@@ -659,7 +778,7 @@ def distributed_piecewise_affine_align(
                 fm_future, shape=fm_p.shape, dtype=fm_p.dtype
             ).rechunk(tuple(blocksize))
         else:
-            fm_da = None
+            fm_da = da.from_array([None,], chunks=(1,))
 
         # mov mask
         if mov_mask is not None:
@@ -668,50 +787,75 @@ def distributed_piecewise_affine_align(
                 mm_future, shape=mm_p.shape, dtype=mm_p.dtype
             ).rechunk(tuple(blocksize))
         else:
-            mm_da = None
+            mm_da = da.from_array([None,], chunks=(1,))
 
-        # TODO: LET RIGID BE A FLAG
-        #       LET STITCHING BE A FLAG
-        #       ALLOW USER TO PROVIDE INITIAL MATRIX FOR EACH BLOCK
-        #       PROVIDE ORIGIN TO ALIGNMENT, DON'T DO IT MANUALLY
+        # establish all keyword arguments
+        random_kwargs = {**kwargs, **random_kwargs}
+        rigid_kwargs = {**kwargs, **rigid_kwargs}
+        affine_kwargs = {**kwargs, **affine_kwargs}
 
         # closure for affine alignment
-        def single_affine_align(fix, mov, fm=None, mm=None, block_info=None):
-            # rigid alignment
-            rigid = affine_align(
-                fix, mov, fix_spacing, mov_spacing,
-                fix_mask=fm, mov_mask=mm,
-                rigid=True,
-                **kwargs,
-            )
-            # affine alignment
-            affine = affine_align(
-                fix, mov, fix_spacing, mov_spacing,
-                fix_mask=fm, mov_mask=mm,
-                initial_transform=rigid,
-                **kwargs,
-            )
+        def single_affine_align(fix, mov, fm, mm, block_info=None):
 
-            # correct for block origin
+            # check for masks
+            if fm.shape != fix.shape: fm = None
+            if mm.shape != mov.shape: mm = None
+
+            # set default
+            affine = np.eye(4)
+
+            # random initialization
+            if 'random' in steps:
+                affine = random_affine_search(
+                    fix, mov, fix_spacing, mov_spacing,
+                    fix_mask=fm, mov_mask=mm,
+                    **random_kwargs,
+                 )
+            # rigid alignment
+            if 'rigid' in steps:
+                affine = affine_align(
+                    fix, mov, fix_spacing, mov_spacing,
+                    fix_mask=fm, mov_mask=mm,
+                    initial_transform=affine,
+                    rigid=True,
+                    **rigid_kwargs,
+                )
+            # affine alignment
+            if 'affine' in steps:
+                affine = affine_align(
+                    fix, mov, fix_spacing, mov_spacing,
+                    fix_mask=fm, mov_mask=mm,
+                    initial_transform=affine,
+                    **affine_kwargs,
+                )
+
+            # adjust for origin
             idx = block_info[0]['chunk-location']
             origin = np.maximum(0, blocksize * idx - overlaps)
             origin = origin * fix_spacing
             tl, tr = np.eye(4), np.eye(4)
             tl[:3, -1], tr[:3, -1] = origin, -origin
             affine = np.matmul(tl, np.matmul(affine, tr))
+
             # return result
             return affine.reshape((1,1,1,4,4))
 
-        # determine variadic arguments
-        arrays = [fix_da, mov_da]
-        if fm_da is not None: arrays.append(fm_da)
-        if mm_da is not None: arrays.append(mm_da)
+        # determine overlaps list
+        overlaps_list = [overlaps, overlaps]
+        if fix_mask is not None:
+            overlaps_list.append(overlaps)
+        else:
+            overlaps_list.append(0)
+        if mov_mask is not None:
+            overlaps_list.append(overlaps)
+        else:
+            overlaps_list.append(0)
 
         # affine align all chunks
         affines = da.map_overlap(
             single_affine_align,
-            *arrays,
-            depth=tuple(overlaps),
+            fix_da, mov_da, fm_da, mm_da,
+            depth=overlaps_list,
             dtype=np.float32,
             boundary='none',
             trim=False,
@@ -720,7 +864,7 @@ def distributed_piecewise_affine_align(
             chunks=[1,1,1,4,4],
         ).compute()
 
-        # TODO: interface may change here
+        # XXX: interface may change here
         # stitch local affines into displacement field
         field = local_affines_to_field(
             fix.shape, fix_spacing,
@@ -737,20 +881,16 @@ def distributed_twist_align(
     fix_spacing,
     mov_spacing,
     block_schedule,
-    overlap=0.5,
+    parameter_schedule=None,
+    initial_transform_list=None,
     fix_mask=None,
     mov_mask=None,
-    alignment_spacing=None,
-    sampling_percentage=1.0,
-    iterations=200,
-    shrink_factors=[2,1],
-    smooth_sigmas=[2.,1.],
     intermediates_path=None,
     cluster_kwargs={},
     **kwargs,
 ):
     """
-    Nested piecewise rigid+affine alignments.
+    Nested piecewise affine alignments.
     Two levels of nesting: outer levels and inner levels.
     Transforms are averaged over inner levels and composed
     across outer levels. See the `block_schedule` parameter
@@ -765,10 +905,8 @@ def distributed_twist_align(
         the fixed image
 
     mov : ndarray
-        the moving image; `fix.shape` must equal `mov.shape`
-        I.e. typically twist alignment is done after
-        a global affine alignment wherein the moving image has
-        been resampled onto the fixed image voxel grid.
+        the moving image; if `initial_transform_list` is None then
+        `fix.shape` must equal `mov.shape`
 
     fix_spacing : 1d array
         The spacing in physical units (e.g. mm or um) between voxels
@@ -812,52 +950,22 @@ def distributed_twist_align(
             by `distributed_piecewise_affine_alignment` and is therefore
             parallelized over blocks on distributed hardware.
 
-    overlap : float or iterable of float in range [0, 1] (default: 0.5)
-        The overlap size between blocks. If a single float then the
-        overlap percentage is the same for all piecewise rigid+affine
-        alignments. If an iterable, the length must equal the total
-        number of tuples in `block_schedule`.
+    parameter_schedule : list of type dict (default: None)
+        Overrides the general parameter `distributed_piecewise_affine_align`
+        parameter settings for individual instances. Length of the list
+        (total number of dictionaries) must equal the total number of
+        tuples in `block_schedule`.
+
+    initial_transform_list : list of ndarrays (default: None)
+        A list of transforms to apply to the moving image before running
+        twist alignment. If `fix.shape` does not equal `mov.shape`
+        then an `initial_transform_list` must be given.
 
     fix_mask : binary ndarray (default: None)
         A mask limiting metric evaluation region of the fixed image
 
     mov_mask : binary ndarray (default: None)
         A mask limiting metric evaluation region of the moving image
-
-    alignment_spacing : float or iterable of float (default: None)
-        Fixed and moving images are skip sampled to a voxel spacing
-        as close as possible to this value. Good for fast coarse
-        alignments. None means use native resolution. If a single
-        float then all alignments are done at that spacing. If an
-        iterable, the length must equal the total number of tuples
-        in `block_schedule`. If an iterable, floats and None can
-        both be used.
-
-    sampling_percentage : float or iterable of float (default: 1.0)
-        Percentage of voxels used during metric sampling. If a single
-        float then all alignments use that percentage. If an iterable
-        then length must equal the total number of tuples in
-        `block_schedule`.
-
-    iterations : int or iterable of int (default: 200)
-        Maximum number of iterations at each scale level to run optimization.
-        Optimization may still converge early. If a single int then all
-        alignments use that value. If an iterable then length must
-        equal the total number of tuples in `block_schedule.
-
-    shrink_factors : iterable of int or iterable of iterables of int (default: [2, 1])
-        Downsampling scale levels at which to optimize. If a single iterable
-        of type int, then all alignments use those scale levels. If an
-        iterable of iterables, then the total number of inner iterables
-        must equal the total number of tuples in `block_schedule`.        
-
-    smooth_sigmas : iterable of float or iterable of iterables of float (default: [2., 1.])
-        Sigma of Gaussian used to smooth each scale level image. Must be
-        same length as `shrink_factors`. Should be specified in physical
-        units, e.g. mm or um. If a single iterable of type float, then all
-        alignments use those values. If an iterable of iterables, then
-        the total number of inner iterables must equal the total number
-        of tuples in `block_schedule`.
 
     intermediates_path : string (default: None)
         Path to folder where intermediate results are written.
@@ -872,7 +980,7 @@ def distributed_twist_align(
         This is how distribution parameters are specified.
 
     kwargs : any additional arguments
-        Passed to `distributed_piecewise_affine_alignment`
+        Passed to `distributed_piecewise_affine_align`
 
     Returns
     -------
@@ -882,48 +990,39 @@ def distributed_twist_align(
         is the vector dimension.
     """
 
-    # keep track of each call to distributed_piecewise_affine_align
-    counter = 0
+    # set working copies of moving data
+    if initial_transform_list is not None:
+        current_moving = apply_transform(
+            fix, mov, fix_spacing, mov_spacing,
+            transform_list=initial_transform_list,
+        )
+        current_moving_mask = None
+        if mov_mask is not None:
+            current_moving_mask = apply_transform(
+                fix, mov_mask, fix_spacing, mov_spacing,
+                transform_list=initial_transform_list,
+            )
+            current_moving_mask = (current_moving_mask > 0).astype(np.uint8)
+    else:
+        current_moving = np.copy(mov)
+        current_moving_mask = None if mov_mask is None else np.copy(mov_mask)
 
-    # initialize container and create working copies of image data
+    # initialize container and Loop over outer levels
+    counter = 0  # count each call to distributed_piecewise_affine_align
     deform = np.zeros(fix.shape + (3,), dtype=np.float32)
-    current_moving = np.copy(mov)
-    current_moving_mask = None if mov_mask is None else np.copy(mov_mask)
-
-    # Loop over outer levels
     for outer_level, inner_list in enumerate(block_schedule):
 
-        # initialize container for inner level results
+        # initialize inner container and Loop over inner levels
         ddd = np.zeros_like(deform)
-
-        # Loop over inner levels
         for inner_level, nblocks in enumerate(inner_list):
 
-            # helper function for determining params
-            def set_kwarg(param, param_key, test_type):
-                x = param
-                if x is not None and type(x) != test_type:
-                    x = param[counter]
-                kwargs[param_key] = x
+            # determine parameter settings
+            if parameter_schedule is not None:
+                instance_kwargs = {**kwargs, **parameter_schedule[counter]}
+            else:
+                instance_kwargs = kwargs
 
-            # set kwargs
-            set_kwarg(overlap, 'overlap', float)
-            set_kwarg(alignment_spacing, 'alignment_spacing', float)
-            set_kwarg(sampling_percentage, 'sampling_percentage', float)
-            set_kwarg(iterations, 'iterations', int)
-
-            # helper function for determining nested params
-            def set_nested_kwarg(param, param_key, test_type):
-                x = param
-                if x is not None and type(x[0]) != test_type:
-                    x = param[counter]
-                kwargs[param_key] = x
-
-            # set nested kwargs
-            set_nested_kwarg(shrink_factors, 'shrink_factors', int)
-            set_nested_kwarg(smooth_sigmas, 'smooth_sigmas', float)
-
-            # wait five seconds - this prevents race conditions
+            # wait thirty seconds - this prevents race conditions
             # with scatter. See issue:
             # https://github.com/dask/distributed/issues/4612
             time.sleep(30)
@@ -931,12 +1030,12 @@ def distributed_twist_align(
             # align
             ddd += distributed_piecewise_affine_align(
                 fix, current_moving,
-                fix_spacing, mov_spacing,
+                fix_spacing, fix_spacing,  # images should be on same grid
                 nblocks=nblocks,
                 fix_mask=fix_mask,
                 mov_mask=current_moving_mask,
                 cluster_kwargs=cluster_kwargs,
-                **kwargs,
+                **instance_kwargs,
             )[1]  # only want the field
 
             # increment counter
@@ -958,26 +1057,31 @@ def distributed_twist_align(
                 )
         deform = deform + ddd
 
+        # combine with initial transforms if given
+        if initial_transform_list is not None:
+            transform_list = initial_transform_list + [deform,]
+        else:
+            transform_list = [deform,]
+
         # update working copy of image
         current_moving = apply_transform(
             fix, mov, fix_spacing, mov_spacing,
-            transform_list=[deform,],
+            transform_list=transform_list,
         )
-
         # update working copy of mask
         if mov_mask is not None:
             current_moving_mask = apply_transform(
                 fix, mov_mask, fix_spacing, mov_spacing,
-                transform_list=[deform,],
+                transform_list=transform_list,
             )
             current_moving_mask = (current_moving_mask > 0).astype(np.uint8)
 
         # write intermediates
         if intermediates_path is not None:
-            ois, iis = str(outer_level), str(inner_level)
-            deform_path = (intermediates_path + '/deform_o{}_i{}.npy').format(ois, iis)
-            image_path = (intermediates_path + '/twisted_o{}_i{}.npy').format(ois, iis)
-            mask_path = (intermediates_path + '/twisted_mask_o{}_i{}.npy').format(ois, iis)
+            ois = str(outer_level)
+            deform_path = (intermediates_path + '/twist_deform_{}.npy').format(ois)
+            image_path = (intermediates_path + '/twist_image_{}.npy').format(ois)
+            mask_path = (intermediates_path + '/twist_mask_{}.npy').format(ois)
             np.save(deform_path, deform)
             np.save(image_path, current_moving)
             if mov_mask is not None:
