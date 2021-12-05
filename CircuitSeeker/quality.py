@@ -109,38 +109,45 @@ def blockwise_cell_quality_score(
     spacing,
     bounds,
     radius,
-    stride,
     mask=None,
     **kwargs,
 ):
     """
     """
 
-    # get container to hold scores
-    scores = np.zeros(image.shape, dtype=np.float32)
+    # determine stride in voxels
+    stride = np.round(radius/spacing).astype(int)
 
     # define weights for linear blend averaging
     ndim = len(image.shape)
     core = np.array([1.]).reshape((1,)*ndim)
-    pad = ([stride, stride],)*ndim
+    pad = tuple([s, s] for s in stride)
     weights = np.pad(core, pad, mode='linear_ramp')
 
+    # pad the array to prevent edge effects in averaging
+    image = np.pad(image, pad, mode='constant')
+    mask = np.pad(mask, pad, mode='constant')
+
     # get valid sample point coordinates
-    edge_limit = max(radius, stride)
     samples = np.zeros(image.shape, dtype=bool)
-    sample_grid = (slice(edge_limit, -edge_limit, stride),)*ndim
+    sample_grid = tuple(slice(s, -s, s) for s in stride)
     samples[sample_grid] = 1
     if mask is not None: samples = samples * mask
     samples = np.nonzero(samples)
 
+    # get container to hold scores
+    scores = np.zeros(image.shape, dtype=np.float32)
+
     # score all blocks
     for iii, coordinate in enumerate(zip(samples[0], samples[1], samples[2])):
-        context = tuple(slice(x-radius, x+radius+1) for x in coordinate)
+        if iii % 100 == 0: print("{} percent complete".format(iii/len(samples[0])))
+        context = tuple(slice(x-r, x+r+1) for x, r in zip(coordinate, stride))
         score = cell_quality_score(image[context], spacing, bounds, **kwargs)
         scores[context] += score * weights
 
     # return result
-    return scores
+    crop = tuple(slice(s, -s) for s in stride)
+    return scores[crop]
 
 
 def jaccard_filter(

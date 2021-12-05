@@ -5,6 +5,7 @@ import SimpleITK as sitk
 import ClusterWrap
 import CircuitSeeker.utility as ut
 from CircuitSeeker.transform import apply_transform
+from CircuitSeeker.transform import compose_displacement_vector_fields
 from CircuitSeeker.quality import jaccard_filter
 import greedypy.greedypy_registration_method as grm
 from scipy.ndimage import minimum_filter, gaussian_filter
@@ -1044,18 +1045,11 @@ def distributed_twist_align(
         # take mean
         ddd = ddd / len(inner_list)
 
-        # compose with existing deform (unless first outer iteration)
-        # TODO: add field composition to transform module
-        ppp = np.ceil(np.max(np.linalg.norm(ddd, axis=-1)) / fix_spacing).astype(int)
+        # if not first iteration, compose with existing deform
         if outer_level > 0:
-            for iii in range(3):
-                padded = np.pad(deform[..., iii], [(ppp[iii], ppp[iii]),]*3, mode='edge')
-                deform[..., iii] = apply_transform(
-                    deform[..., iii], padded, fix_spacing, fix_spacing,
-                    transform_list=[ddd,],
-                    mov_origin=fix_spacing * -ppp[iii],
-                )
-        deform = deform + ddd
+            deform = compose_displacement_vector_fields(
+                deform, ddd, fix_spacing,
+            )
 
         # combine with initial transforms if given
         if initial_transform_list is not None:

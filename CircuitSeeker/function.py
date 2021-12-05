@@ -32,7 +32,7 @@ def deltafoverf(
 
 
 def distributed_deltafoverf(
-    zarr_array,
+    zarr_path,
     window_size,
     batch_size,
     write_path,
@@ -45,32 +45,38 @@ def distributed_deltafoverf(
     # launch cluster
     with ClusterWrap.cluster(**cluster_kwargs) as cluster:
 
-        # wrap data as dask array
-        chunks = (batch_size,) + zarr_array.chunks[1:]
-        array_da = da.from_array(zarr_array, chunks=chunks)
+        # lazy load zarr to get metadata
+        metadata = zarr.open(zarr_path, 'r')
 
-        # define asymmetric depth for time axis only
-        depth = {**{0:(window_size, 0)}, **{i: 0 for i in range(1, zarr_array.ndim)}}
+        # get block start indices
+        start_indices, start_index = [], 0
+        while start_index + window_size < metadata.shape[0]:
+            start_indices.append(start_index)
+            start_index = start_index + batch_size - window_size
 
-        # define closure for deltafoverf
-        def wrapped_deltafoverf(array, block_info=None):
-            dff = deltafoverf(array, window_size)
-            if block_info[0]['chunk-location'][0] == 0:
-                pad = [(window_size, 0),] + [(0, 0),]*(dff.ndim - 1)
-                dff = np.pad(dff, pad, mode='empty')
-            return dff
+        # convert to dask array
+        start_indices_da = da.from_array(start_indices, chunks=(1,))
 
-        # map deltafoverf function over blocks
-        dff = da.map_overlap(
-            wrapped_deltafoverf, array_da,
-            depth=depth,
+        # wrap deltafoverf function
+        def wrapped_deltafoverf(index):
+            zarr_file = zarr.open(zarr_path, 'r')
+            data = zarr_file[index[0]:index[0]+batch_size]
+            return deltafoverf(data, window_size)
+ 
+        # map function to each block
+        dff = da.map_blocks(
+            wrapped_deltafoverf, start_indices_da,
             dtype=np.float16,
-            boundary='none',
-            trim=False,
+            new_axis=list(range(1, metadata.ndim)),
+            chunks=(batch_size-window_size,) + metadata.chunks[1:],
         )
 
-        # trim beginning and rechunk to single frames
-        dff = dff[window_size:].rechunk(zarr_array.chunks)
+        # ensure the correct shape and rechunk for faster writing
+        dff = dff[:metadata.shape[0] - window_size]
+        dff = dff.rechunk((1,) + metadata.chunks[1:])
+
+        # persist dff before writing to zarr, prevents RAM conflicts
+        dff = dff.persist()
 
         # write to output zarr
         compressor = Blosc(
@@ -81,7 +87,7 @@ def distributed_deltafoverf(
         dff_disk = zarr.open(
             write_path, 'w',
             shape=dff.shape,
-            chunks=zarr_array.chunks,
+            chunks=metadata.chunks,
             dtype=dff.dtype,
             compressor=compressor,
         )
