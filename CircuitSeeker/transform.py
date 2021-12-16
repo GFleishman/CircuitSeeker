@@ -12,6 +12,7 @@ def apply_transform(
     transform_spacing=None,
     fix_origin=None,
     mov_origin=None,
+    interpolate_with_nn=False,
     extrapolate_with_nn=False,
 ):
     """
@@ -61,6 +62,10 @@ def apply_transform(
     resampler.SetNumberOfThreads(2*ncores)
     resampler.SetReferenceImage(sitk.Cast(fix, sitk.sitkFloat32))
     resampler.SetTransform(transform)
+
+    # check for NN interpolation
+    if interpolate_with_nn:
+        resampler.SetInterpolator(sitk.sitkNearestNeighbor)
 
     # check for NN extrapolation
     if extrapolate_with_nn:
