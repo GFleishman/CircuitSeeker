@@ -833,8 +833,8 @@ def alignment_pipeline(
         'affine' : run `affine_align`
         'deform' : run `deformable_align`
 
-        There are some limitations. Currently you cannot run 'random' and 'rigid'
-        in the same pipeline. Also, 'deform' is not yet implemented'
+        Currently you cannot run 'random' and 'rigid' in the same pipeline.
+        Hoping to enable this in the future.
 
     fix_mask : binary ndarray (default: None)
         A mask limiting metric evaluation region of the fixed image
@@ -864,12 +864,15 @@ def alignment_pipeline(
 
     Returns
     -------
-    transform : ndarray
-        Single transform aligning moving to fixed image.
-        All steps are composed.
-        If all steps are affine alignments ('random', 'rigid', 'affine'),
-        this is a 4x4 matrix. If the final step is 'deform' this is an
-        ndarray with shape equal to fix.shape + (3,)
+    transform : ndarray or tuple of ndarray
+        Transform(s) aligning moving to fixed image.
+
+        If 'deform' is not in `steps` then this is a single 4x4 matrix - all
+        steps ('random', 'rigid', and/or 'affine') are composed.
+
+        If 'deform' is in `steps` then this is a tuple. The first element
+        is the composed 4x4 affine matrix, the second is a displacement
+        vector field with shape equal to fix.shape + (3,)
     """
 
     # TODO: rigid could be done before random, but random would
@@ -921,10 +924,21 @@ def alignment_pipeline(
         )
     # deformable align
     if 'deform' in steps:
-        raise NotImplementedError("deformable in progress")
+        deform = deformable_align(
+            fix, mov,
+            fix_spacing, mov_spacing,
+            fix_mask=fix_mask,
+            mov_mask=mov_mask,
+            fix_origin=fix_origin,
+            mov_origin=mov_origin,
+            initial_transform=affine,
+            **deform_kwargs,
+        )
+        return affine, deform
 
-    # return result
-    return affine
+    # return affine result
+    else:
+        return affine
 
 
 def distributed_piecewise_alignment_pipeline(
