@@ -806,6 +806,7 @@ def alignment_pipeline(
     rigid_kwargs={},
     affine_kwargs={},
     deform_kwargs={},
+    **kwargs,
 ):
     """
     Compose random, rigid, affine, and deformable alignment with one function call
@@ -867,6 +868,12 @@ def alignment_pipeline(
     deform_kwargs : dict (default: None)
         Arguments passed to `deformable_align`
 
+    **kwargs : any additional keyword arguments
+        Global arguments that apply to all alignment steps
+        These are overwritten by specific arguments passed via
+        `random_kwargs`, `rigid_kwargs`, `affine_kwargs`, and
+        `deform_kwargs`
+
     Returns
     -------
     transform : ndarray or tuple of ndarray
@@ -890,6 +897,12 @@ def alignment_pipeline(
 
     # set default
     affine = initial_transform if initial_transform is not None else np.eye(4)
+
+    # establish all keyword arguments
+    random_kwargs = {**kwargs, **random_kwargs}
+    rigid_kwargs = {**kwargs, **rigid_kwargs}
+    affine_kwargs = {**kwargs, **affine_kwargs}
+    deform_kwargs = {**kwargs, **deform_kwargs}
 
     # random initialization
     if 'random' in steps:
