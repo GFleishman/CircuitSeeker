@@ -7,8 +7,6 @@ import CircuitSeeker.utility as ut
 from CircuitSeeker.transform import apply_transform
 from CircuitSeeker.transform import compose_displacement_vector_fields
 from CircuitSeeker.quality import jaccard_filter
-import greedypy.greedypy_registration_method as grm
-from scipy.ndimage import minimum_filter, gaussian_filter
 from scipy.spatial.transform import Rotation
 
 # TODO: need to refactor stitching
@@ -616,7 +614,7 @@ def affine_align(
         return default
 
 
-def bspline_deformable_align(
+def deformable_align(
     fix,
     mov,
     fix_spacing,
@@ -809,6 +807,69 @@ def alignment_pipeline(
     deform_kwargs={},
 ):
     """
+    Compose random, rigid, affine, and deformable alignment with one function call
+
+    Parameters
+    ----------
+    fix : ndarray
+        the fixed image
+
+    mov : ndarray
+        the moving image; `fix.ndim` must equal `mov.ndim`
+
+    fix_spacing : 1d array
+        The spacing in physical units (e.g. mm or um) between voxels
+        of the fixed image.
+        Length must equal `fix.ndim`
+
+    mov_spacing : 1d array
+        The spacing in physical units (e.g. mm or um) between voxels
+        of the moving image.
+
+    steps : list of strings
+        Alignment steps to run. Options include:
+        'random' : run `random_affine_search`
+        'rigid' : run `affine_align` with `rigid=True`
+        'affine' : run `affine_align`
+        'deform' : run `deformable_align`
+
+        There are some limitations. Currently you cannot run 'random' and 'rigid'
+        in the same pipeline. Also, 'deform' is not yet implemented'
+
+    fix_mask : binary ndarray (default: None)
+        A mask limiting metric evaluation region of the fixed image
+
+    mov_mask : binary ndarray (default: None)
+        A mask limiting metric evaluation region of the moving image
+
+    fix_origin : 1d array (default: None)
+        Origin of the fixed image.
+        Length must equal `fix.ndim`
+
+    mov_origin : 1d array (default: None)
+        Origin of the moving image.
+        Length must equal `mov.ndim`
+
+    random_kwargs : dict (default: None)
+        Arguments passed to `random_affine_search`
+
+    rigid_kwargs : dict (default: None)
+        Arguments passed to `affine_align` when `rigid=True` (rigid alignment)
+
+    affine_kwargs : dict (default: None)
+        Arguments passed to `affine_align` when `rigid=False` (affine alignment)
+
+    deform_kwargs : dict (default: None)
+        Arguments passed to `deformable_align`
+
+    Returns
+    -------
+    transform : ndarray
+        Single transform aligning moving to fixed image.
+        All steps are composed.
+        If all steps are affine alignments ('random', 'rigid', 'affine'),
+        this is a 4x4 matrix. If the final step is 'deform' this is an
+        ndarray with shape equal to fix.shape + (3,)
     """
 
     # TODO: rigid could be done before random, but random would
