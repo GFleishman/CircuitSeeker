@@ -797,6 +797,7 @@ def alignment_pipeline(
     fix_spacing,
     mov_spacing,
     steps,
+    initial_transform=None,
     fix_mask=None,
     mov_mask=None,
     fix_origin=None,
@@ -835,6 +836,10 @@ def alignment_pipeline(
 
         Currently you cannot run 'random' and 'rigid' in the same pipeline.
         Hoping to enable this in the future.
+
+    initial_transform : ndarray (default: None)
+        An initial transform. This should be a 4x4 affine matrix.
+        Not compatible with 'random' in `steps`
 
     fix_mask : binary ndarray (default: None)
         A mask limiting metric evaluation region of the fixed image
@@ -884,7 +889,7 @@ def alignment_pipeline(
         raise ValueError(message)
 
     # set default
-    affine = np.eye(4)
+    affine = initial_transform if initial_transform is not None else np.eye(4)
 
     # random initialization
     if 'random' in steps:
