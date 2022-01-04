@@ -1,5 +1,8 @@
+import functools
 import numpy as np
 import SimpleITK as sitk
+import ClusterWrap
+import dask
 
 
 def skip_sample(image, spacing, ss_spacing):
@@ -135,3 +138,30 @@ def bspline_to_displacement_field(reference, bspline):
     )
     return sitk.GetArrayFromImage(df).astype(np.float32)[..., ::-1]
 
+
+def check_cluster(func):
+    @functools.wraps(func)
+    def create_or_pass_cluster(*args, **kwargs):
+        if 'cluster' in kwargs:
+            cluster = kwargs.pop('cluster')
+        else:
+            cluster = None
+        if cluster is None:
+            if 'cluster_kwargs' in kwargs:
+                cluster_kwargs = kwargs.pop('cluster_kwargs')
+            else:
+                cluster_kwargs = {}
+            with ClusterWrap.cluster(**cluster_kwargs) as cluster:
+                return func(*args, **kwargs, cluster=cluster)
+        else:
+            return func(*args, **kwargs, cluster=cluster)
+    return create_or_pass_cluster
+
+
+def scatter_dask_array(cluster, array):
+    if not isinstance(array, dask.array.Array):
+        future = cluster.client.scatter(array)
+        da = dask.array.from_delayed(future, shape=array.shape, dtype=array.dtype)
+        return da
+    else:
+        return array
