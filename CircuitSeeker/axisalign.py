@@ -204,6 +204,9 @@ def align_sagittal_medial_polynomials(
     return force_to_displacement(force, score_function, **kwargs)
 
 
+
+
+
 def symmetric_padding(image, center):
     """
     """
