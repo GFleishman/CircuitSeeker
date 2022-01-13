@@ -1,5 +1,9 @@
 import numpy as np
 import SimpleITK as sitk
+import functools
+import ClusterWrap
+import dask
+from scipy.ndimage import zoom
 
 
 def skip_sample(image, spacing, ss_spacing):
@@ -124,7 +128,7 @@ def bspline_parameters_to_transform(parameters):
     return t
 
 
-def bspline_to_displacement_field(reference, bspline):
+def bspline_to_displacement_field(reference, bspline, shape=None):
     """
     """
 
@@ -133,5 +137,21 @@ def bspline_to_displacement_field(reference, bspline):
         reference.GetSize(), reference.GetOrigin(),
         reference.GetSpacing(), reference.GetDirection(),
     )
-    return sitk.GetArrayFromImage(df).astype(np.float32)[..., ::-1]
+    df = sitk.GetArrayFromImage(df).astype(np.float32)[..., ::-1]
+    if shape is not None:
+        new_shape = [x / y for x, y in zip(shape, df.shape[:-1])] + [1,]
+        df = zoom(df, new_shape, order=1, mode='nearest')
+    return df
+
+
+def scatter_dask_array(cluster, array):
+    """
+    """
+
+    if not isinstance(array, dask.array.Array):
+        future = cluster.client.scatter(array)
+        da = dask.array.from_delayed(future, shape=array.shape, dtype=array.dtype)
+        return da
+    else:
+        return array
 

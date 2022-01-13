@@ -2,15 +2,13 @@ import os, sys, psutil, time
 import numpy as np
 import dask.array as da
 import SimpleITK as sitk
-import ClusterWrap
+from ClusterWrap.decorator import cluster
 import CircuitSeeker.utility as ut
 from CircuitSeeker.transform import apply_transform
+from CircuitSeeker.transform import compose_affine_and_displacement_vector_field
 from CircuitSeeker.transform import compose_displacement_vector_fields
 from CircuitSeeker.quality import jaccard_filter
 from scipy.spatial.transform import Rotation
-
-# TODO: need to refactor stitching
-from dask_stitch.local_affine import local_affines_to_field
 
 
 def configure_irm(
@@ -627,6 +625,7 @@ def deformable_align(
     mov_mask=None,
     fix_origin=None,
     mov_origin=None,
+    jaccard_filter_threshold=None,
     default=None,
     **kwargs,
 ):
@@ -687,6 +686,13 @@ def deformable_align(
         Origin of the moving image.
         Length must equal `mov.ndim`
 
+    jaccard_filter_threshold : float in range [0, 1] (default: None)
+        If `jaccard_filter_threshold`, `fix_mask`, and `mov_mask` are all
+        defined (i.e. not None), then the Jaccard index between the masks
+        is computed. If the index is less than this threshold the alignment
+        is skipped and the default is returned. Useful for distributed piecewise
+        workflows over heterogenous data.
+
     default : any object (default: None)
         If optimization fails to improve image matching metric,
         print an error but also return this object. If None
@@ -709,6 +715,20 @@ def deformable_align(
         points
     """
 
+    # check jaccard index
+    a = jaccard_filter_threshold is not None
+    b = fix_mask is not None
+    c = mov_mask is not None
+    failed_jaccard = False
+    if a and b and c:
+        if not jaccard_filter(fix_mask, mov_mask, jaccard_filter_threshold):
+            print("Masks failed jaccard_filter")
+            print("Returning default")
+            failed_jaccard = True
+
+    # store initial fixed image shape
+    initial_fix_shape = fix.shape
+
     # skip sample to alignment spacing
     if alignment_spacing is not None:
         fix, fix_spacing_ss = ut.skip_sample(fix, fix_spacing, alignment_spacing)
@@ -720,9 +740,11 @@ def deformable_align(
         fix_spacing = fix_spacing_ss
         mov_spacing = mov_spacing_ss
 
-    # convert to sitk images
+    # convert to sitk images, float32 type
     fix = ut.numpy_to_sitk(fix, fix_spacing, origin=fix_origin)
     mov = ut.numpy_to_sitk(mov, mov_spacing, origin=mov_origin)
+    fix = sitk.Cast(fix, sitk.sitkFloat32)
+    mov = sitk.Cast(mov, sitk.sitkFloat32)
 
     # set up registration object
     irm = configure_irm(**kwargs)
@@ -751,8 +773,13 @@ def deformable_align(
         fp = transform.GetFixedParameters()
         pp = transform.GetParameters()
         default_params = np.array(list(fp) + list(pp))
-        default_field = ut.bspline_to_displacement_field(fix, transform)
+        default_field = ut.bspline_to_displacement_field(
+            fix, transform, shape=initial_fix_shape,
+        )
         default = (default_params, default_field)
+
+    # now that default is defined, determine jaccard result
+    if failed_jaccard: return default
 
     # set masks
     if fix_mask is not None:
@@ -762,18 +789,16 @@ def deformable_align(
         mov_mask = ut.numpy_to_sitk(mov_mask, mov_spacing, origin=mov_origin)
         irm.SetMetricMovingMask(mov_mask)
 
-    # execute alignment
-    irm.Execute(
-        sitk.Cast(fix, sitk.sitkFloat32),
-        sitk.Cast(mov, sitk.sitkFloat32),
-    )
-
-    # get initial and final metric values
-    initial_metric_value = irm.MetricEvaluate(
-        sitk.Cast(fix, sitk.sitkFloat32),
-        sitk.Cast(mov, sitk.sitkFloat32),
-    )
-    final_metric_value = irm.GetMetricValue()
+    # execute alignment, for any exceptions return default
+    try:
+        initial_metric_value = irm.MetricEvaluate(fix, mov)
+        irm.Execute(fix, mov)
+        final_metric_value = irm.MetricEvaluate(fix, mov)
+    except Exception as e:
+        print("Registration failed due to ITK exception:\n", e)
+        print("\nReturning default")
+        sys.stdout.flush()
+        return default
 
     # if registration improved metric return result
     # otherwise return default
@@ -782,10 +807,14 @@ def deformable_align(
         fp = transform.GetFixedParameters()
         pp = transform.GetParameters()
         params = np.array(list(fp) + list(pp))
-        field = ut.bspline_to_displacement_field(fix, transform)
+        field = ut.bspline_to_displacement_field(
+            fix, transform, shape=initial_fix_shape,
+        )
         return params, field
     else:
         print("Optimization failed to improve metric")
+        print("initial value: {}".format(initial_metric_value))
+        print("final value: {}".format(final_metric_value))
         print("Returning default")
         sys.stdout.flush()
         return default
@@ -959,6 +988,7 @@ def alignment_pipeline(
         return affine
 
 
+@cluster
 def distributed_piecewise_alignment_pipeline(
     fix,
     mov,
@@ -972,6 +1002,8 @@ def distributed_piecewise_alignment_pipeline(
     random_kwargs={},
     rigid_kwargs={},
     affine_kwargs={},
+    deform_kwargs={},
+    cluster=None,
     cluster_kwargs={},
     **kwargs,
 ):
@@ -1076,131 +1108,174 @@ def distributed_piecewise_alignment_pipeline(
         the displacement vector.
     """
 
+    # wait for at least one worker to be fully  instantiated
+    while ((cluster.client.status == "running") and
+           (len(cluster.client.scheduler_info()["workers"]) < 1)):
+        time.sleep(1.0)
+
     # compute block size and overlaps
     blocksize = np.array(fix.shape).astype(np.float32) / nblocks
     blocksize = np.ceil(blocksize).astype(np.int16)
     overlaps = tuple(np.round(blocksize * overlap).astype(np.int16))
 
-    # set up cluster
-    with ClusterWrap.cluster(**cluster_kwargs) as cluster:
+    # pad the ends to fill in the last blocks
+    # blocks must all be exact for stitch to work correctly
+    pads = [(0, y - x % y) if x % y > 0
+        else (0, 0) for x, y in zip(fix.shape, blocksize)]
+    fix_p = np.pad(fix, pads)
+    mov_p = np.pad(mov, pads)
 
-        # XXX EXPERIMENTAL
-        while ((cluster.client.status == "running") and
-               (len(cluster.client.scheduler_info()["workers"]) < 1)):
-            time.sleep(1.0)
+    # pad masks if necessary
+    if fix_mask is not None:
+        fm_p = np.pad(fix_mask, pads)
+    if mov_mask is not None:
+        mm_p = np.pad(mov_mask, pads)
 
-        # pad the ends to fill in the last blocks
-        # blocks must all be exact for stitch to work correctly
-        pads = [(0, y - x % y) if x % y > 0
-            else (0, 0) for x, y in zip(fix.shape, blocksize)]
-        fix_p = np.pad(fix, pads)
-        mov_p = np.pad(mov, pads)
+    # CONSTRUCT DASK ARRAY VERSION OF OBJECTS
+    # fix
+    fix_future = cluster.client.scatter(fix_p)
+    fix_da = da.from_delayed(
+        fix_future, shape=fix_p.shape, dtype=fix_p.dtype
+    ).rechunk(tuple(blocksize))
 
-        # pad masks if necessary
-        if fix_mask is not None:
-            fm_p = np.pad(fix_mask, pads)
-        if mov_mask is not None:
-            mm_p = np.pad(mov_mask, pads)
+    # mov
+    mov_future = cluster.client.scatter(mov_p)
+    mov_da = da.from_delayed(
+        mov_future, shape=mov_p.shape, dtype=mov_p.dtype
+    ).rechunk(tuple(blocksize))
 
-        # CONSTRUCT DASK ARRAY VERSION OF OBJECTS
-        # fix
-        fix_future = cluster.client.scatter(fix_p)
-        fix_da = da.from_delayed(
-            fix_future, shape=fix_p.shape, dtype=fix_p.dtype
+    # fix mask
+    if fix_mask is not None:
+        fm_future = cluster.client.scatter(fm_p)
+        fm_da = da.from_delayed(
+            fm_future, shape=fm_p.shape, dtype=fm_p.dtype
         ).rechunk(tuple(blocksize))
+    else:
+        fm_da = da.from_array([None,], chunks=(1,))
 
-        # mov
-        mov_future = cluster.client.scatter(mov_p)
-        mov_da = da.from_delayed(
-            mov_future, shape=mov_p.shape, dtype=mov_p.dtype
+    # mov mask
+    if mov_mask is not None:
+        mm_future = cluster.client.scatter(mm_p)
+        mm_da = da.from_delayed(
+            mm_future, shape=mm_p.shape, dtype=mm_p.dtype
         ).rechunk(tuple(blocksize))
+    else:
+        mm_da = da.from_array([None,], chunks=(1,))
 
-        # fix mask
-        if fix_mask is not None:
-            fm_future = cluster.client.scatter(fm_p)
-            fm_da = da.from_delayed(
-                fm_future, shape=fm_p.shape, dtype=fm_p.dtype
-            ).rechunk(tuple(blocksize))
+    # establish all keyword arguments
+    random_kwargs = {**kwargs, **random_kwargs}
+    rigid_kwargs = {**kwargs, **rigid_kwargs}
+    affine_kwargs = {**kwargs, **affine_kwargs}
+    deform_kwargs = {**kwargs, **deform_kwargs}
+
+    # closure for alignment pipeline
+    def align_single_block(fix, mov, fm, mm, block_info=None):
+        
+        # check for masks
+        if fm.shape != fix.shape: fm = None
+        if mm.shape != mov.shape: mm = None
+
+        # run alignment pipeline
+        transform = alignment_pipeline(
+            fix, mov, fix_spacing, mov_spacing, steps,
+            fix_mask=fm, mov_mask=mm,
+            random_kwargs=random_kwargs,
+            rigid_kwargs=rigid_kwargs,
+            affine_kwargs=affine_kwargs,
+            deform_kwargs=deform_kwargs,
+        )
+
+        # convert to single vector field
+        if isinstance(transform, tuple):
+            affine, deform = transform[0], transform[1][1]
+            transform = compose_affine_and_displacement_vector_field(
+                affine, deform, fix_spacing,
+            )
         else:
-            fm_da = da.from_array([None,], chunks=(1,))
-
-        # mov mask
-        if mov_mask is not None:
-            mm_future = cluster.client.scatter(mm_p)
-            mm_da = da.from_delayed(
-                mm_future, shape=mm_p.shape, dtype=mm_p.dtype
-            ).rechunk(tuple(blocksize))
-        else:
-            mm_da = da.from_array([None,], chunks=(1,))
-
-        # establish all keyword arguments
-        random_kwargs = {**kwargs, **random_kwargs}
-        rigid_kwargs = {**kwargs, **rigid_kwargs}
-        affine_kwargs = {**kwargs, **affine_kwargs}
-
-        # closure for alignment pipeline
-        def align_single_block(fix, mov, fm, mm, block_info=None):
-            
-            # check for masks
-            if fm.shape != fix.shape: fm = None
-            if mm.shape != mov.shape: mm = None
-
-            # run alignment pipeline
-            affine = alignment_pipeline(
-                fix, mov, fix_spacing, mov_spacing,
-                fix_mask=fm, mov_mask=mm,
-                random_kwargs=random_kwargs,
-                rigid_kwargs=rigid_kwargs,
-                affine_kwargs=affine_kwargs,
+            transform = ut.matrix_to_displacement_field(
+                fix, transform, fix_spacing,
             )
 
-            # adjust for origin
-            idx = block_info[0]['chunk-location']
-            origin = np.maximum(0, blocksize * idx - overlaps)
-            origin = origin * fix_spacing
-            tl, tr = np.eye(4), np.eye(4)
-            tl[:3, -1], tr[:3, -1] = origin, -origin
-            affine = np.matmul(tl, np.matmul(affine, tr))
+        # get block index and block grid size
+        block_grid = block_info[0]['num-chunks']
+        block_index = block_info[0]['chunk-location']
 
-            # return result
-            return affine.reshape((1,1,1,4,4))
-        # END CLOSURE
+        # create weights array
+        core, pad_ones, pad_linear = [], [], []
+        for i in range(3):
 
-        # determine overlaps list
-        overlaps_list = [overlaps, overlaps]
-        if fix_mask is not None:
-            overlaps_list.append(overlaps)
-        else:
-            overlaps_list.append(0)
-        if mov_mask is not None:
-            overlaps_list.append(overlaps)
-        else:
-            overlaps_list.append(0)
+            # get core shape and pad sizes
+            o = max(0, 2*overlaps[i]-1)
+            c = blocksize[i] - o + 1
+            p_ones, p_linear = [0, 0], [o, o]
+            if block_index[i] == 0:
+                p_ones[0], p_linear[0] = o//2, 0
+            if block_index[i] == block_grid[i] - 1:
+                p_ones[1], p_linear[1] = o//2, 0
+            core.append(c)
+            pad_ones.append(tuple(p_ones))
+            pad_linear.append(tuple(p_linear))
 
-        # affine align all chunks
-        affines = da.map_overlap(
-            align_single_block,
-            fix_da, mov_da, fm_da, mm_da,
-            depth=overlaps_list,
-            dtype=np.float32,
-            boundary='none',
-            trim=False,
-            align_arrays=False,
-            new_axis=[3,4],
-            chunks=[1,1,1,4,4],
-        ).compute()
+        # create weights core
+        weights = np.ones(core, dtype=np.float32)
 
-        # XXX: interface may change here
-        # stitch local affines into displacement field
-        field = local_affines_to_field(
-            fix.shape, fix_spacing,
-            affines, blocksize, overlaps,
-        ).compute()
+        # extend weights
+        weights = np.pad(
+            weights, pad_ones, mode='constant', constant_values=1,
+        )
+        weights = np.pad(
+            weights, pad_linear, mode='linear_ramp', end_values=0,
+        )
 
-        # return both formats
-        return affines, field
+        # apply weights
+        transform = transform * weights[..., None]
+
+        # package and return result
+        result = np.empty((1,1,1), dtype=object)
+        result[0, 0, 0] = transform
+        return result
+    # END CLOSURE
+
+    # determine overlaps list
+    overlaps_list = [overlaps, overlaps]
+    if fix_mask is not None:
+        overlaps_list.append(overlaps)
+    else:
+        overlaps_list.append(0)
+    if mov_mask is not None:
+        overlaps_list.append(overlaps)
+    else:
+        overlaps_list.append(0)
+
+    # align all chunks
+    fields = da.map_overlap(
+        align_single_block,
+        fix_da, mov_da, fm_da, mm_da,
+        depth=overlaps_list,
+        dtype=object,
+        boundary='none',
+        trim=False,
+        align_arrays=False,
+        chunks=[1,1,1],
+    ).compute()
+
+    # reconstruct single transform
+    transform = np.zeros(fix_p.shape + (3,), dtype=np.float32)
+
+    # adds fields to transform
+    block_grid = fields.shape[:3]
+    for ijk in range(np.prod(block_grid)):
+        i, j, k = np.unravel_index(ijk, block_grid)
+        x, y, z = (max(0, x*y-z) for x, y, z in zip((i, j, k), blocksize, overlaps))
+        xr, yr, zr = fields[i, j, k].shape[:3]
+        transform[x:x+xr, y:y+yr, z:z+zr] += fields[i, j, k][...]
+
+    # crop back to original shape and return
+    x, y, z = fix.shape
+    return transform[:x, :y, :z]
 
 
+@cluster
 def nested_distributed_piecewise_alignment_pipeline(
     fix,
     mov,
@@ -1212,6 +1287,7 @@ def nested_distributed_piecewise_alignment_pipeline(
     fix_mask=None,
     mov_mask=None,
     intermediates_path=None,
+    cluster=None,
     cluster_kwargs={},
     **kwargs,
 ):
@@ -1348,21 +1424,17 @@ def nested_distributed_piecewise_alignment_pipeline(
             else:
                 instance_kwargs = kwargs
 
-            # wait thirty seconds - this prevents race conditions
-            # with scatter. See issue:
-            # https://github.com/dask/distributed/issues/4612
-            time.sleep(30)
-
             # align
-            ddd += distributed_piecewise_affine_align(
+            ddd += distributed_piecewise_alignment_pipeline(
                 fix, current_moving,
                 fix_spacing, fix_spacing,  # images should be on same grid
                 nblocks=nblocks,
                 fix_mask=fix_mask,
                 mov_mask=current_moving_mask,
+                cluster=cluster,
                 cluster_kwargs=cluster_kwargs,
                 **instance_kwargs,
-            )[1]  # only want the field
+            )
 
             # increment counter
             counter += 1
@@ -1375,6 +1447,8 @@ def nested_distributed_piecewise_alignment_pipeline(
             deform = compose_displacement_vector_fields(
                 deform, ddd, fix_spacing,
             )
+        else:
+            deform = ddd
 
         # combine with initial transforms if given
         if initial_transform_list is not None:
