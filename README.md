@@ -18,6 +18,13 @@ CircuitSeeker contains rigid, affine, deformable, and highly customizable piecew
 ## Installation
 `pip install CircuitSeeker`
 
+## Versions
+* Current dev (on github): 0.4.2
+* Current stable (on PyPI): 0.4.1
+
+
+I don't have a proper system for versioning. I bump minor version when I add small features, mid version when a refactor affects the API, and have yet to bump the major version number. I try to keep the github version more current than PyPI, which is hopefully a stable implementation.
+
 ## Documentation
 Most user level functions have docstrings, which I strive to keep up to date, but much more work is needed. Don't hesitate to reach out with questions. **Please use the github issue tracker for questions and support.**
 
