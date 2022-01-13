@@ -49,7 +49,7 @@ Most user level functions have docstrings, which I strive to keep up to date, bu
 * distributed deltaF over F
 
 ## Examples
-I've included some of my own Jupyter notebooks here. These were not designed as tutorials per se, but should be helpful. Much more work is needed to properly describe/share the full range of CircuitSeeker capabilities.
+I've included some of my own [Jupyter notebooks here](https://github.com/GFleishman/CircuitSeeker/tree/master/notebooks). These were not designed as tutorials and bear in mind that some aspects (especially anything distributed or requiring a cluster) are specific to my own computing environment. But these notebooks will still be helpful in getting you started. Much more work is needed to properly describe/share the full range of CircuitSeeker capabilities.
 
 ## Dependencies
 These amazing packages make CircuitSeeker possible. They are automatically installed with CircuitSeeker:
