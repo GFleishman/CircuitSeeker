@@ -34,8 +34,8 @@ def bounded_fourier_shell_correlation(
     elif fix.dtype == np.float64:
         cdtype = np.complex128
     else:
-        error = "Images must be uint16, float32, or float64"
-        error += "Given array dtype is " + str(image.dtype)
+        error = "Images must be uint16, float32, or float64 \n"
+        error += "fix dtype is: " + str(fix.dtype) + " mov dtype is: " + str(mov.dtype)
         raise TypeError(error)
 
     # ensure datatypes stay the same

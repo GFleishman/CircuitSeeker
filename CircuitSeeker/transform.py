@@ -108,6 +108,8 @@ def apply_transform_to_coordinates(
         return coordinates.transpose() * transform_spacing + dX
 
 
+# TODO: convert this and following function into single function "compose"
+#       that checks types with conditionals and does the right thing
 def compose_displacement_vector_fields(
     first_field,
     second_field,

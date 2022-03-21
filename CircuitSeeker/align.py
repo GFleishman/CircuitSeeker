@@ -181,9 +181,6 @@ def random_affine_search(
         fix_spacing = fix_spacing_ss
         mov_spacing = mov_spacing_ss
 
-    # keep track of poor alignments later
-    fail_count = 0
-
     # define metric evaluation
     if use_patch_mutual_information:
 
@@ -248,15 +245,17 @@ def random_affine_search(
             try:
                 return irm.MetricEvaluate(fix_sitk, mov_sitk)
             except Exception as e:
-                fail_count += 1
                 return np.finfo(scores.dtype).max
 
     # score all random affines
+    fail_count = 0
     current_best_score = 0
     scores = np.empty(random_iterations + 1)
     for iii, ppp in enumerate(params):
         aff = params_to_affine_matrix(ppp)
         scores[iii] = score_affine(aff)
+        if scores[iii] == np.finfo(scores.dtype).max:
+            fail_count += 1
 
         # print running improvements
         if print_running_improvements:

@@ -4,7 +4,7 @@ import ClusterWrap
 import CircuitSeeker.fileio as csio
 import CircuitSeeker.utility as ut
 from CircuitSeeker.align import affine_align
-from CircuitSeeker.align import bspline_deformable_align
+from CircuitSeeker.align import deformable_align
 from CircuitSeeker.transform import apply_transform
 import dask.array as da
 import dask.delayed as delayed
