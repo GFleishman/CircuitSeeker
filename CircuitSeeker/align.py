@@ -1,4 +1,4 @@
-import sys, time
+import sys, time, os, shutil
 import numpy as np
 import dask.array as da
 import SimpleITK as sitk
@@ -880,6 +880,7 @@ def distributed_piecewise_alignment_pipeline(
     deform_kwargs={},
     cluster=None,
     cluster_kwargs={},
+    temporary_directory=None,
     **kwargs,
 ):
     """
@@ -1008,32 +1009,70 @@ def distributed_piecewise_alignment_pipeline(
 
     # CONSTRUCT DASK ARRAY VERSION OF OBJECTS
     # fix
-    fix_future = cluster.client.scatter(fix_p)
-    fix_da = da.from_delayed(
-        fix_future, shape=fix_p.shape, dtype=fix_p.dtype
-    ).rechunk(tuple(blocksize))
+#    fix_future = cluster.client.scatter(fix_p)
+#    fix_da = da.from_delayed(
+#        fix_future, shape=fix_p.shape, dtype=fix_p.dtype
+#    ).rechunk(tuple(blocksize))
+#
+#    # mov
+#    mov_future = cluster.client.scatter(mov_p)
+#    mov_da = da.from_delayed(
+#        mov_future, shape=mov_p.shape, dtype=mov_p.dtype
+#    ).rechunk(tuple(blocksize))
+#
+#    # fix mask
+#    if fix_mask is not None:
+#        fm_future = cluster.client.scatter(fm_p)
+#        fm_da = da.from_delayed(
+#            fm_future, shape=fm_p.shape, dtype=fm_p.dtype
+#        ).rechunk(tuple(blocksize))
+#    else:
+#        fm_da = da.from_array([None,], chunks=(1,))
+#
+#    # mov mask
+#    if mov_mask is not None:
+#        mm_future = cluster.client.scatter(mm_p)
+#        mm_da = da.from_delayed(
+#            mm_future, shape=mm_p.shape, dtype=mm_p.dtype
+#        ).rechunk(tuple(blocksize))
+#    else:
+#        mm_da = da.from_array([None,], chunks=(1,))
 
-    # mov
-    mov_future = cluster.client.scatter(mov_p)
-    mov_da = da.from_delayed(
-        mov_future, shape=mov_p.shape, dtype=mov_p.dtype
-    ).rechunk(tuple(blocksize))
+    # STORE DATA ON DISK WHERE WORKERS CAN READ IT
+    # ensure temporary directory exists
+    if temporary_directory is None:
+        temporary_directory = os.getcwd()
+    os.makedirs(temporary_directory, exist_ok=True)
 
-    # fix mask
+    # define zarr paths
+    fix_zarr_path = temporary_directory + '/fix.zarr'
+    mov_zarr_path = temporary_directory + '/mov.zarr'
+    fix_mask_zarr_path = temporary_directory + '/fix_mask.zarr'
+    mov_mask_zarr_path = temporary_directory + '/mov_mask.zarr'
+
+    # array creation functions needs tuple of python dtype
+    zarr_blocks = (128,)*len(fix_p.shape)
+
+    # create dask array wraps of image zarr files
+    fix_da = da.from_array(
+        ut.numpy_to_zarr(fix_p, zarr_blocks, fix_zarr_path), chunks=tuple(blocksize),
+    )
+    mov_da = da.from_array(
+        ut.numpy_to_zarr(mov_p, zarr_blocks, mov_zarr_path), chunks=tuple(blocksize),
+    )
+
+    # create dask array wraps of mask zarr files
     if fix_mask is not None:
-        fm_future = cluster.client.scatter(fm_p)
-        fm_da = da.from_delayed(
-            fm_future, shape=fm_p.shape, dtype=fm_p.dtype
-        ).rechunk(tuple(blocksize))
+        fm_da = da.from_array(
+            ut.numpy_to_zarr(fm_p, zarr_blocks, fix_mask_zarr_path), chunks=tuple(blocksize),
+        )
     else:
         fm_da = da.from_array([None,], chunks=(1,))
 
-    # mov mask
     if mov_mask is not None:
-        mm_future = cluster.client.scatter(mm_p)
-        mm_da = da.from_delayed(
-            mm_future, shape=mm_p.shape, dtype=mm_p.dtype
-        ).rechunk(tuple(blocksize))
+        mm_da = da.from_array(
+            ut.numpy_to_zarr(mm_p, zarr_blocks, mov_mask_zarr_path), chunks=tuple(blocksize),
+        )
     else:
         mm_da = da.from_array([None,], chunks=(1,))
 

@@ -4,6 +4,8 @@ import functools
 import ClusterWrap
 import dask
 from scipy.ndimage import zoom
+import zarr
+from numcodecs import Blosc
 
 
 def skip_sample(image, spacing, ss_spacing):
@@ -152,6 +154,27 @@ def scatter_dask_array(cluster, array):
         future = cluster.client.scatter(array)
         da = dask.array.from_delayed(future, shape=array.shape, dtype=array.dtype)
         return da
+    else:
+        return array
+
+
+def numpy_to_zarr(array, chunks, path):
+    """
+    """
+
+    if not isinstance(array, zarr.Array):
+        compressor = Blosc(
+            cname='zstd', clevel=4, shuffle=Blosc.BITSHUFFLE,
+        )
+        zarr_disk = zarr.open(
+            path, 'w',
+            shape=array.shape,
+            chunks=chunks,
+            dtype=array.dtype,
+            compressor=compressor,
+        )
+        zarr_disk[...] = array
+        return zarr_disk
     else:
         return array
 
