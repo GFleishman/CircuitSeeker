@@ -5,7 +5,9 @@ import ClusterWrap
 import dask
 from scipy.ndimage import zoom
 import zarr
+from zarr.indexing import BasicIndexer
 from numcodecs import Blosc
+from distributed import Lock
 
 
 def skip_sample(image, spacing, ss_spacing):
@@ -158,21 +160,40 @@ def scatter_dask_array(cluster, array):
         return array
 
 
+def create_zarr(path, shape, chunks, dtype, chunk_locked=False, client=None):
+    """
+    """
+
+    compressor = Blosc(
+        cname='zstd', clevel=4, shuffle=Blosc.BITSHUFFLE,
+    )
+    zarr_disk = zarr.open(
+        path, 'w',
+        shape=shape,
+        chunks=chunks,
+        dtype=dtype,
+        compressor=compressor,
+    )
+
+    if chunk_locked:
+        indexer = BasicIndexer(slice(None), zarr_disk)
+        keys = (zarr_disk._chunk_key(idx.chunk_coords) for idx in indexer)
+        lock = {key: Lock(key, client=client) for key in keys}
+        lock['.zarray'] = Lock('.zarray', client=client)
+        zarr_disk = zarr.open(
+            store=zarr_disk.store, path=zarr_disk.path,
+            synchronizer=lock, mode='a',
+        )
+
+    return zarr_disk
+    
+
 def numpy_to_zarr(array, chunks, path):
     """
     """
 
     if not isinstance(array, zarr.Array):
-        compressor = Blosc(
-            cname='zstd', clevel=4, shuffle=Blosc.BITSHUFFLE,
-        )
-        zarr_disk = zarr.open(
-            path, 'w',
-            shape=array.shape,
-            chunks=chunks,
-            dtype=array.dtype,
-            compressor=compressor,
-        )
+        zarr_disk = create_zarr(path, array.shape, chunks, array.dtype)
         zarr_disk[...] = array
         return zarr_disk
     else:

@@ -11,6 +11,8 @@ from CircuitSeeker.transform import compose_displacement_vector_fields
 from CircuitSeeker.quality import jaccard_filter
 from CircuitSeeker.metrics import patch_mutual_information
 from scipy.spatial.transform import Rotation
+import zarr
+from itertools import product
 
 
 def random_affine_search(
@@ -984,15 +986,10 @@ def distributed_piecewise_alignment_pipeline(
         the displacement vector.
     """
 
-    # wait for at least one worker to be fully  instantiated
-    while ((cluster.client.status == "running") and
-           (len(cluster.client.scheduler_info()["workers"]) < 1)):
-        time.sleep(1.0)
-
     # compute block size and overlaps
     blocksize = np.array(fix.shape).astype(np.float32) / nblocks
     blocksize = np.ceil(blocksize).astype(np.int16)
-    overlaps = tuple(np.round(blocksize * overlap).astype(np.int16))
+    overlaps = np.round(blocksize * overlap).astype(np.int16)
 
     # pad the ends to fill in the last blocks
     # blocks must all be exact for stitch to work correctly
@@ -1000,81 +997,50 @@ def distributed_piecewise_alignment_pipeline(
         else (0, 0) for x, y in zip(fix.shape, blocksize)]
     fix_p = np.pad(fix, pads)
     mov_p = np.pad(mov, pads)
-
-    # pad masks if necessary
     if fix_mask is not None:
         fm_p = np.pad(fix_mask, pads)
     if mov_mask is not None:
         mm_p = np.pad(mov_mask, pads)
 
-    # CONSTRUCT DASK ARRAY VERSION OF OBJECTS
-    # fix
-#    fix_future = cluster.client.scatter(fix_p)
-#    fix_da = da.from_delayed(
-#        fix_future, shape=fix_p.shape, dtype=fix_p.dtype
-#    ).rechunk(tuple(blocksize))
-#
-#    # mov
-#    mov_future = cluster.client.scatter(mov_p)
-#    mov_da = da.from_delayed(
-#        mov_future, shape=mov_p.shape, dtype=mov_p.dtype
-#    ).rechunk(tuple(blocksize))
-#
-#    # fix mask
-#    if fix_mask is not None:
-#        fm_future = cluster.client.scatter(fm_p)
-#        fm_da = da.from_delayed(
-#            fm_future, shape=fm_p.shape, dtype=fm_p.dtype
-#        ).rechunk(tuple(blocksize))
-#    else:
-#        fm_da = da.from_array([None,], chunks=(1,))
-#
-#    # mov mask
-#    if mov_mask is not None:
-#        mm_future = cluster.client.scatter(mm_p)
-#        mm_da = da.from_delayed(
-#            mm_future, shape=mm_p.shape, dtype=mm_p.dtype
-#        ).rechunk(tuple(blocksize))
-#    else:
-#        mm_da = da.from_array([None,], chunks=(1,))
-
-    # STORE DATA ON DISK WHERE WORKERS CAN READ IT
     # ensure temporary directory exists
     if temporary_directory is None:
         temporary_directory = os.getcwd()
-    os.makedirs(temporary_directory, exist_ok=True)
+    temporary_directory += '/distributed_alignment_temp'
+    os.makedirs(temporary_directory)
 
     # define zarr paths
     fix_zarr_path = temporary_directory + '/fix.zarr'
     mov_zarr_path = temporary_directory + '/mov.zarr'
     fix_mask_zarr_path = temporary_directory + '/fix_mask.zarr'
     mov_mask_zarr_path = temporary_directory + '/mov_mask.zarr'
+    transform_zarr_path = temporary_directory + '/transform.zarr'
 
-    # array creation functions needs tuple of python dtype
+    # create zarr files
     zarr_blocks = (128,)*len(fix_p.shape)
-
-    # create dask array wraps of image zarr files
-    fix_da = da.from_array(
-        ut.numpy_to_zarr(fix_p, zarr_blocks, fix_zarr_path), chunks=tuple(blocksize),
-    )
-    mov_da = da.from_array(
-        ut.numpy_to_zarr(mov_p, zarr_blocks, mov_zarr_path), chunks=tuple(blocksize),
-    )
-
-    # create dask array wraps of mask zarr files
+    fix_zarr = ut.numpy_to_zarr(fix_p, zarr_blocks, fix_zarr_path)
+    mov_zarr = ut.numpy_to_zarr(mov_p, zarr_blocks, mov_zarr_path)
     if fix_mask is not None:
-        fm_da = da.from_array(
-            ut.numpy_to_zarr(fm_p, zarr_blocks, fix_mask_zarr_path), chunks=tuple(blocksize),
-        )
-    else:
-        fm_da = da.from_array([None,], chunks=(1,))
-
+        fix_mask_zarr = ut.numpy_to_zarr(fm_p, zarr_blocks, fix_mask_zarr_path)
     if mov_mask is not None:
-        mm_da = da.from_array(
-            ut.numpy_to_zarr(mm_p, zarr_blocks, mov_mask_zarr_path), chunks=tuple(blocksize),
-        )
-    else:
-        mm_da = da.from_array([None,], chunks=(1,))
+        mov_mask_zarr = ut.numpy_to_zarr(mm_p, zarr_blocks, mov_mask_zarr_path)
+    transform_zarr = ut.create_zarr(
+        transform_zarr_path, fix_p.shape + (len(fix_p.shape),),
+        zarr_blocks + (len(fix_p.shape),), np.float32,
+        chunk_locked=True,
+        client=cluster.client,
+    )
+
+    return 0
+
+    # determine indices for blocking
+    indices = np.empty( (np.prod(nblocks), 9), dtype=int)
+    for indx, (i, j, k) in enumerate(product(*[range(x) for x in nblocks])):
+        start = blocksize * (i, j, k) - overlaps
+        stop = start + blocksize + 2 * overlaps
+        start = np.maximum(0, start)
+        indices[indx, 0:3] = [i, j, k]
+        indices[indx, 3:6] = start.astype(int)
+        indices[indx, 6:9] = stop.astype(int)
 
     # establish all keyword arguments
     random_kwargs = {**kwargs, **random_kwargs}
@@ -1083,16 +1049,27 @@ def distributed_piecewise_alignment_pipeline(
     deform_kwargs = {**kwargs, **deform_kwargs}
 
     # closure for alignment pipeline
-    def align_single_block(fix, mov, fm, mm, block_info=None):
-        
-        # check for masks
-        if fm.shape != fix.shape: fm = None
-        if mm.shape != mov.shape: mm = None
+    def align_single_block(coords):
+
+        # squeeze the coords and convert to tuple of slices
+        coords = coords.squeeze()
+        block_grid = nblocks
+        block_index = coords[0:3]
+        coords = tuple(slice(x, y) for x, y in zip(coords[3:6], coords[6:9]))
+
+        # read the chunks
+        fix = fix_zarr[coords]
+        mov = mov_zarr[coords]
+        fix_mask, mov_mask = None, None
+        if os.path.isdir(fix_mask_zarr_path):
+            fix_mask = fix_mask_zarr[coords]
+        if os.path.isdir(mov_mask_zarr_path):
+            mov_mask = mov_mask_zarr[coords]
 
         # run alignment pipeline
         transform = alignment_pipeline(
             fix, mov, fix_spacing, mov_spacing, steps,
-            fix_mask=fm, mov_mask=mm,
+            fix_mask=fix_mask, mov_mask=mov_mask,
             random_kwargs=random_kwargs,
             rigid_kwargs=rigid_kwargs,
             affine_kwargs=affine_kwargs,
@@ -1109,10 +1086,6 @@ def distributed_piecewise_alignment_pipeline(
             transform = ut.matrix_to_displacement_field(
                 fix, transform, fix_spacing,
             )
-
-        # get block index and block grid size
-        block_grid = block_info[0]['num-chunks']
-        block_index = block_info[0]['chunk-location']
 
         # create weights array
         core, pad_ones, pad_linear = [], [], []
@@ -1141,48 +1114,25 @@ def distributed_piecewise_alignment_pipeline(
             weights, pad_linear, mode='linear_ramp', end_values=0,
         )
 
-        # apply weights
-        transform = transform * weights[..., None]
-
-        # package and return result
-        result = np.empty((1,1,1), dtype=object)
-        result[0, 0, 0] = transform
-        return result
+        # read the transform, modify it, and resave
+        existing_transform = transform_zarr[coords]
+        transform = existing_transform + transform * weights[..., None]
+        transform_zarr[coords] = transform
     # END CLOSURE
 
-    # determine overlaps list
-    overlaps_list = [overlaps, overlaps]
-    if fix_mask is not None:
-        overlaps_list.append(overlaps)
-    else:
-        overlaps_list.append(0)
-    if mov_mask is not None:
-        overlaps_list.append(overlaps)
-    else:
-        overlaps_list.append(0)
+    # wait for at least one worker to be fully  instantiated
+    while ((cluster.client.status == "running") and
+           (len(cluster.client.scheduler_info()["workers"]) < 1)):
+        time.sleep(1.0)
 
-    # align all chunks
-    fields = da.map_overlap(
-        align_single_block,
-        fix_da, mov_da, fm_da, mm_da,
-        depth=overlaps_list,
-        dtype=object,
-        boundary='none',
-        trim=False,
-        align_arrays=False,
-        chunks=[1,1,1],
-    ).compute()
+    # run alignment on all blocks
+    cluster.client.gather(cluster.client.map(align_single_block, indices))
 
-    # reconstruct single transform
-    transform = np.zeros(fix_p.shape + (3,), dtype=np.float32)
+    # read transform
+    transform = transform_zarr[:]
 
-    # adds fields to transform
-    block_grid = fields.shape[:3]
-    for ijk in range(np.prod(block_grid)):
-        i, j, k = np.unravel_index(ijk, block_grid)
-        x, y, z = (max(0, x*y-z) for x, y, z in zip((i, j, k), blocksize, overlaps))
-        xr, yr, zr = fields[i, j, k].shape[:3]
-        transform[x:x+xr, y:y+yr, z:z+zr] += fields[i, j, k][...]
+    # remove temporary files
+    shutil.rmtree(temporary_directory)
 
     # crop back to original shape and return
     x, y, z = fix.shape
