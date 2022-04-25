@@ -182,7 +182,7 @@ def create_zarr(path, shape, chunks, dtype, chunk_locked=False, client=None):
         lock['.zarray'] = Lock('.zarray', client=client)
         zarr_disk = zarr.open(
             store=zarr_disk.store, path=zarr_disk.path,
-            synchronizer=lock, mode='a',
+            synchronizer=lock, mode='r+',
         )
 
     return zarr_disk

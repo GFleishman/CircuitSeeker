@@ -1,6 +1,7 @@
 import sys, time, os, shutil
 import numpy as np
 import dask.array as da
+from dask.distributed import as_completed
 import SimpleITK as sitk
 from ClusterWrap.decorator import cluster
 import CircuitSeeker.utility as ut
@@ -998,9 +999,9 @@ def distributed_piecewise_alignment_pipeline(
     fix_p = np.pad(fix, pads)
     mov_p = np.pad(mov, pads)
     if fix_mask is not None:
-        fm_p = np.pad(fix_mask, pads)
+        fix_mask_p = np.pad(fix_mask, pads)
     if mov_mask is not None:
-        mm_p = np.pad(mov_mask, pads)
+        mov_mask_p = np.pad(mov_mask, pads)
 
     # ensure temporary directory exists
     if temporary_directory is None:
@@ -1013,34 +1014,25 @@ def distributed_piecewise_alignment_pipeline(
     mov_zarr_path = temporary_directory + '/mov.zarr'
     fix_mask_zarr_path = temporary_directory + '/fix_mask.zarr'
     mov_mask_zarr_path = temporary_directory + '/mov_mask.zarr'
-    transform_zarr_path = temporary_directory + '/transform.zarr'
 
     # create zarr files
     zarr_blocks = (128,)*len(fix_p.shape)
     fix_zarr = ut.numpy_to_zarr(fix_p, zarr_blocks, fix_zarr_path)
     mov_zarr = ut.numpy_to_zarr(mov_p, zarr_blocks, mov_zarr_path)
     if fix_mask is not None:
-        fix_mask_zarr = ut.numpy_to_zarr(fm_p, zarr_blocks, fix_mask_zarr_path)
+        fix_mask_zarr = ut.numpy_to_zarr(fix_mask_p, zarr_blocks, fix_mask_zarr_path)
     if mov_mask is not None:
-        mov_mask_zarr = ut.numpy_to_zarr(mm_p, zarr_blocks, mov_mask_zarr_path)
-    transform_zarr = ut.create_zarr(
-        transform_zarr_path, fix_p.shape + (len(fix_p.shape),),
-        zarr_blocks + (len(fix_p.shape),), np.float32,
-        chunk_locked=True,
-        client=cluster.client,
-    )
-
-    return 0
+        mov_mask_zarr = ut.numpy_to_zarr(mov_mask_p, zarr_blocks, mov_mask_zarr_path)
 
     # determine indices for blocking
-    indices = np.empty( (np.prod(nblocks), 9), dtype=int)
-    for indx, (i, j, k) in enumerate(product(*[range(x) for x in nblocks])):
+    indices = []
+    for (i, j, k) in product(*[range(x) for x in nblocks]):
         start = blocksize * (i, j, k) - overlaps
         stop = start + blocksize + 2 * overlaps
         start = np.maximum(0, start)
-        indices[indx, 0:3] = [i, j, k]
-        indices[indx, 3:6] = start.astype(int)
-        indices[indx, 6:9] = stop.astype(int)
+        stop = np.minimum(fix_p.shape, stop)
+        coords = tuple(slice(x, y) for x, y in zip(start, stop))
+        indices.append((i, j, k, coords))
 
     # establish all keyword arguments
     random_kwargs = {**kwargs, **random_kwargs}
@@ -1049,13 +1041,11 @@ def distributed_piecewise_alignment_pipeline(
     deform_kwargs = {**kwargs, **deform_kwargs}
 
     # closure for alignment pipeline
-    def align_single_block(coords):
+    def align_single_block(indices):
 
         # squeeze the coords and convert to tuple of slices
-        coords = coords.squeeze()
-        block_grid = nblocks
-        block_index = coords[0:3]
-        coords = tuple(slice(x, y) for x, y in zip(coords[3:6], coords[6:9]))
+        block_index = indices[:3]
+        coords = indices[3]
 
         # read the chunks
         fix = fix_zarr[coords]
@@ -1097,7 +1087,7 @@ def distributed_piecewise_alignment_pipeline(
             p_ones, p_linear = [0, 0], [o, o]
             if block_index[i] == 0:
                 p_ones[0], p_linear[0] = o//2, 0
-            if block_index[i] == block_grid[i] - 1:
+            if block_index[i] == nblocks[i] - 1:
                 p_ones[1], p_linear[1] = o//2, 0
             core.append(c)
             pad_ones.append(tuple(p_ones))
@@ -1114,22 +1104,27 @@ def distributed_piecewise_alignment_pipeline(
             weights, pad_linear, mode='linear_ramp', end_values=0,
         )
 
-        # read the transform, modify it, and resave
-        existing_transform = transform_zarr[coords]
-        transform = existing_transform + transform * weights[..., None]
-        transform_zarr[coords] = transform
+        # return the weighted transform
+        return transform * weights[..., None]
     # END CLOSURE
 
-    # wait for at least one worker to be fully  instantiated
+    # wait for at least one worker to be fully instantiated
     while ((cluster.client.status == "running") and
            (len(cluster.client.scheduler_info()["workers"]) < 1)):
         time.sleep(1.0)
 
-    # run alignment on all blocks
-    cluster.client.gather(cluster.client.map(align_single_block, indices))
+    # submit all alignments to cluster
+    futures = cluster.client.map(align_single_block, indices)
+    future_keys = [f.key for f in futures]
 
-    # read transform
-    transform = transform_zarr[:]
+    # meanwhile, initialize container for result
+    transform = np.zeros(fix_p.shape + (len(fix_p.shape),), dtype=np.float32)
+
+    # and monitor progress of alignments, write blocks when finished
+    for batch in as_completed(futures, with_results=True).batches():
+        for future, result in batch:
+            iii = future_keys.index(future.key)
+            transform[indices[iii][3]] += result
 
     # remove temporary files
     shutil.rmtree(temporary_directory)
