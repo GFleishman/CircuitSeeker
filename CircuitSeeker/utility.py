@@ -31,7 +31,7 @@ def numpy_to_sitk(image, spacing, origin=None, vector=False):
         error += "Given array dtype is " + str(image.dtype)
         raise TypeError(error)
 
-    image = sitk.GetImageFromArray(image.copy(), isVector=vector)
+    image = sitk.GetImageFromArray(image, isVector=vector)
     image.SetSpacing(spacing[::-1])
     if origin is None:
         origin = np.zeros(len(spacing))
@@ -113,12 +113,12 @@ def matrix_to_displacement_field(reference, matrix, spacing):
     return np.einsum('...ij,...j->...i', mm, grid) + tt - grid
 
 
-def field_to_displacement_field_transform(field, spacing):
+def field_to_displacement_field_transform(field, spacing, origin=None):
     """
     """
 
     field = field.astype(np.float64)[..., ::-1]
-    transform = numpy_to_sitk(field, spacing, vector=True)
+    transform = numpy_to_sitk(field, spacing, vector=True, origin=origin)
     return sitk.DisplacementFieldTransform(transform)
 
 

@@ -1,8 +1,11 @@
 import numpy as np
 import SimpleITK as sitk
 import CircuitSeeker.utility as ut
-import os, psutil
+import os, psutil, shutil
 from scipy.ndimage import map_coordinates
+from ClusterWrap.decorator import cluster
+import dask.array as da
+import zarr
 
 
 def apply_transform(
@@ -10,6 +13,7 @@ def apply_transform(
     fix_spacing, mov_spacing,
     transform_list,
     transform_spacing=None,
+    transform_origin=None,
     fix_origin=None,
     mov_origin=None,
     interpolate_with_nn=False,
@@ -52,7 +56,7 @@ def apply_transform(
             else:
                 sp = transform_spacing
             # create field
-            t = ut.field_to_displacement_field_transform(t, sp)
+            t = ut.field_to_displacement_field_transform(t, sp, transform_origin)
 
         # add to composite transform
         transform.AddTransform(t)
@@ -74,6 +78,149 @@ def apply_transform(
     # execute, return as numpy array
     resampled = resampler.Execute(sitk.Cast(mov, sitk.sitkFloat32))
     return sitk.GetArrayFromImage(resampled).astype(dtype)
+
+
+@cluster
+def distributed_apply_transform(
+    fix_zarr, mov_zarr,
+    fix_spacing, mov_spacing,
+    transform_list,
+    blocksize,
+    write_path,
+    transform_spacing=None,
+    dataset_path=None,
+    temporary_directory=None,
+    cluster=None,
+    cluster_kwargs={},
+):
+    """
+    """
+
+    # TODO: generalize
+    affine, deform = transform_list
+
+    # blocksize should be an array
+    blocksize = np.array(blocksize)
+
+    # ensure temporary directory exists
+    if temporary_directory is None:
+        temporary_directory = os.getcwd()
+    temporary_directory += '/distributed_apply_transform_temp'
+    os.makedirs(temporary_directory)
+
+    # write deform as zarr file
+    zarr_path = temporary_directory + '/deform.zarr'
+    zarr_blocks = (128,)*len(blocksize) + (3,)
+    deform_zarr = ut.numpy_to_zarr(deform, zarr_blocks, zarr_path)
+
+    # get overlap and number of blocks
+    overlap = np.round(blocksize * 0.5).astype(int)
+    nblocks = np.ceil(np.array(fix_zarr.shape) / blocksize).astype(int)
+
+    # store block coordinates in a dask array
+    block_coords = np.empty(nblocks, dtype=tuple)
+    for (i, j, k) in np.ndindex(*nblocks):
+        start = blocksize * (i, j, k) - overlap
+        stop = start + blocksize + 2 * overlap
+        start = np.maximum(0, start)
+        stop = np.minimum(fix_zarr.shape, stop)
+        coords = tuple(slice(x, y) for x, y in zip(start, stop))
+        block_coords[i, j, k] = coords
+    block_coords = da.from_array(block_coords, chunks=(1,)*block_coords.ndim)
+
+    # pipeline to run on each block
+    def transform_single_block(coords):
+
+        # fetch coords slice and deform
+        coords = coords.item()
+
+        # read relevant part of transform
+        # TODO: double check transform origin for example, make sure no error being introduced!
+        deform_coords = coords
+        if fix_zarr.shape != deform_zarr.shape[:-1]:
+            ratio = np.array(deform_zarr.shape[:-1]) / fix_zarr.shape
+            starts = np.round([s.start * r for s, r in zip(coords, ratio)]).astype(int)
+            stops = np.round([s.stop * r for s, r in zip(coords, ratio)]).astype(int)
+            deform_coords = tuple(slice(a, b) for a, b in zip(starts, stops))
+        deform = deform_zarr[deform_coords]
+
+        # determine bounding box around moving image region
+        # get initial voxel coords
+        start_ijk = tuple(s.start for s in coords)
+        stop_ijk = tuple(s.stop for s in coords)
+
+        # convert to physical units, add the displacements
+        start_xyz = np.array(start_ijk) * fix_spacing + deform[(0,)*len(coords)]
+        stop_xyz = np.array(stop_ijk) * fix_spacing + deform[(-1,)*len(coords)]
+
+        # apply the affine
+        start_mov_xyz = np.matmul(affine, np.concatenate((start_xyz, (1,))))
+        stop_mov_xyz = np.matmul(affine, np.concatenate((stop_xyz, (1,))))
+
+        # convert to voxel units, take outer box, ensure coords within range
+        start_mov = np.floor(start_mov_xyz[:-1] / mov_spacing).astype(int)
+        start_mov = np.maximum(0, start_mov)
+        stop_mov = np.ceil(stop_mov_xyz[:-1] / mov_spacing).astype(int)
+        stop_mov = np.minimum(mov_zarr.shape, stop_mov)
+
+        # convert back to tuple of slice
+        mov_coords = tuple(slice(a, b) for a, b in zip(start_mov, stop_mov))
+
+        # read the data
+        fix = fix_zarr[coords]
+        mov = mov_zarr[mov_coords]
+
+        # determine origin
+        fix_origin = fix_spacing * [s.start for s in coords]
+        mov_origin = mov_spacing * [s.start for s in mov_coords]
+
+        # resample
+        aligned = apply_transform(
+            fix, mov, fix_spacing, mov_spacing,
+            transform_list=[affine, deform],
+            transform_spacing=transform_spacing,
+            transform_origin=fix_origin,
+            fix_origin=fix_origin,
+            mov_origin=mov_origin,
+        )
+
+        # crop out overlap
+        for axis in range(aligned.ndim):
+
+            # left side
+            slc = [slice(None),]*aligned.ndim
+            if coords[axis].start != 0:
+                slc[axis] = slice(overlap[axis], None)
+                aligned = aligned[tuple(slc)]
+
+            # right side
+            slc = [slice(None),]*aligned.ndim
+            if aligned.shape[axis] > blocksize[axis]:
+                slc[axis] = slice(None, blocksize[axis])
+                aligned = aligned[tuple(slc)]
+
+        # return result
+        return aligned
+
+    # align all blocks
+    aligned = da.map_blocks(
+        transform_single_block,
+        block_coords,
+        dtype=fix_zarr.dtype,
+        chunks=blocksize,
+    )
+
+    # crop to original size
+    aligned = aligned[tuple(slice(0, s) for s in fix_zarr.shape)]
+
+    # compute result, write to zarr array
+    da.to_zarr(aligned, write_path, component=dataset_path)
+
+    # remove temporary directory
+    shutil.rmtree(temporary_directory)
+
+    # return reference to result
+    return zarr.open(write_path, 'r+')
 
 
 def apply_transform_to_coordinates(
