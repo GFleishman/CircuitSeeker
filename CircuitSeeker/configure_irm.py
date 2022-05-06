@@ -3,12 +3,12 @@ import SimpleITK as sitk
 
 
 def configure_irm(
-    metric,
-    optimizer,
-    sampling,
-    interpolator,
-    shrink_factors,
-    smooth_sigmas,
+    metric='MMI',
+    optimizer='RSGD'
+    sampling='NONE',
+    interpolator='1',
+    shrink_factors=(1,),
+    smooth_sigmas=(0,),
     metric_args={},
     optimizer_args={},
     sampling_percentage=None,
@@ -22,7 +22,7 @@ def configure_irm(
 
     Parameters
     ----------
-    metric : string
+    metric : string (default: 'MMI')
         The image matching function optimized during alignment
         Some options have required metric_args. See SimpleITK documentation for
         itk::simple::ImageRegistrationMethod and look for SetMetricAs* functions
@@ -34,7 +34,7 @@ def configure_irm(
             'MMI':   MattesMutualInformation
             'MS':    MeanSquares
 
-    optimizer : string
+    optimizer : string (default: 'RSGD')
         Optimization algorithm used to improve metric and update transform
         Some options have required optimizer_args. See SimpleITK documentation for
         itk::simple::ImageRegistrationMethod and look for SetOptimizerAs* functions
@@ -50,7 +50,7 @@ def configure_irm(
             'P':        Powell
             'RSGD':     RegularStepGradientDescent
 
-    sampling : string
+    sampling : string (default: 'NONE')
         How image intensities are sampled in space during metric calculation
         'REGULAR' and 'RANDOM' options influenced by 'sampling_percentage'
         Options:
@@ -58,7 +58,7 @@ def configure_irm(
             'REGULAR':  Regular spacing between samples, small random perturbation from voxel centers
             'RANDOM':   Sample positions are totally random
 
-    interpolator : string
+    interpolator : string (default: '1')
         Interpolation function used to compute image values at non-voxel center locations
         See SimpleITK documentation for itk:simple Namespace Reference and search for
         InterpolatorEnum
@@ -78,10 +78,10 @@ def configure_irm(
             'LWS':  LanczosWindowedSinc,
             'BWS':  BlackmanWindowedSinc,
 
-    shrink_factors : tuple of int
+    shrink_factors : tuple of int (default: (1,))
         Downsampling scale levels at which to optimize
 
-    smooth_sigmas : tuple of float
+    smooth_sigmas : tuple of float (default: (0,))
         Sigma of Gaussian used to smooth each scale level image
         Must be same length as `shrink_factors`
         Should be specified in physical units, e.g. mm or um
