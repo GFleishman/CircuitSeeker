@@ -1,6 +1,6 @@
 import numpy as np
 import SimpleITK as sitk
-from CircuitSeeker._wrap_irm import configure_irm
+from CircuitSeeker.configure_irm import configure_irm
 import CircuitSeeker.utility as ut
 
 
@@ -41,6 +41,20 @@ def patch_mutual_information(
     # convert to list of coordinates
     samples = np.column_stack(np.nonzero(samples))
 
+    # we'll use an irm for metric, set metric/irm defauls
+    kwargs['metric'] = 'MMI'
+    if 'metric_args' not in kwargs:
+        kwargs['metric_args'] = {'numberOfHistogramBins':32}
+    if 'sampling' not in kwargs:
+        kwargs['sampling'] = 'NONE'
+    # next param only matters if sampling is 'REGULAR' or 'RANDOM'
+    if 'interpolator' not in kwargs:
+        kwargs['interpolator'] = '1'
+    # following arguments are totally unused, values are irrelevant
+    kwargs['optimizer'] = 'A'
+    kwargs['shrink_factors'] = (1,)
+    kwargs['smooth_sigmas'] = (1,)
+    
     # create irm for evaluating metric
     irm = configure_irm(**kwargs)
 
