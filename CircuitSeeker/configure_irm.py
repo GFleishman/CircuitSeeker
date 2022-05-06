@@ -158,6 +158,8 @@ def configure_irm(
         'MMI':irm.SetMetricAsMattesMutualInformation,
         'MS':irm.SetMetricAsMeanSquares,
     }
+    if metric in ('MMI', 'JHMI') and 'numberOfHistogramBins' not in metric_args:
+        metric_args['numberOfHistogramBins'] = 32
     metric_switch[metric](**metric_args)
 
     # sampling switch
