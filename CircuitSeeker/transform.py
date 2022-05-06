@@ -31,40 +31,18 @@ def apply_transform(
 
     # convert images to sitk objects
     dtype = fix.dtype
-    fix = ut.numpy_to_sitk(fix, fix_spacing, fix_origin)
-    mov = ut.numpy_to_sitk(mov, mov_spacing, mov_origin)
+    fix = sitk.Cast(ut.numpy_to_sitk(fix, fix_spacing, fix_origin), sitk.sitkFloat32)
+    mov = sitk.Cast(ut.numpy_to_sitk(mov, mov_spacing, mov_origin), sitk.sitkFloat32)
 
     # construct transform
-    transform = sitk.CompositeTransform(3)
-    for i, t in enumerate(transform_list):
-
-        # affine transforms
-        if len(t.shape) == 2:
-            t = ut.matrix_to_affine_transform(t)
-
-        # bspline parameters
-        elif len(t.shape) == 1:
-            t = ut.bspline_parameters_to_transform(t)
-
-        # fields
-        elif len(t.shape) == 4:
-            # set transform_spacing
-            if transform_spacing is None:
-                sp = fix_spacing
-            elif isinstance(transform_spacing[i], tuple):
-                sp = transform_spacing[i]
-            else:
-                sp = transform_spacing
-            # create field
-            t = ut.field_to_displacement_field_transform(t, sp, transform_origin)
-
-        # add to composite transform
-        transform.AddTransform(t)
+    transform = ut.transform_list_to_composite_transform(
+        transform_list, transform_spacing or fix_spacing, transform_origin,
+    )
 
     # set up resampler object
     resampler = sitk.ResampleImageFilter()
     resampler.SetNumberOfThreads(2*ncores)
-    resampler.SetReferenceImage(sitk.Cast(fix, sitk.sitkFloat32))
+    resampler.SetReferenceImage(fix)
     resampler.SetTransform(transform)
 
     # check for NN interpolation
@@ -76,7 +54,7 @@ def apply_transform(
         resampler.SetUseNearestNeighborExtrapolator(True)
 
     # execute, return as numpy array
-    resampled = resampler.Execute(sitk.Cast(mov, sitk.sitkFloat32))
+    resampled = resampler.Execute(mov)
     return sitk.GetArrayFromImage(resampled).astype(dtype)
 
 
@@ -255,8 +233,6 @@ def apply_transform_to_coordinates(
         return coordinates.transpose() * transform_spacing + dX
 
 
-# TODO: convert this and following function into single function "compose"
-#       that checks types with conditionals and does the right thing
 def compose_displacement_vector_fields(
     first_field,
     second_field,
@@ -283,25 +259,27 @@ def compose_displacement_vector_fields(
     return first_field_warped + second_field
 
 
-def compose_affine_and_displacement_vector_field(
-    transform_one,
-    transform_two,
-    spacing,
-):
+def compose_transforms(transform_one, transform_two, spacing):
     """
     """
 
-    # reformat affine as displacement vector field
-    if transform_one.shape == (4, 4):
+    # two affines
+    if transform_one.shape == (4, 4) and transform_two.shape == (4, 4):
+        return np.matmul(transform_one, transform_two)
+
+    # one affine, two field
+    elif transform_one.shape == (4, 4):
         transform_one = ut.matrix_to_displacement_field(
             transform_two[..., 0], transform_one, spacing,
         )
-    else:
+
+    # one field, two affine
+    elif transform_two.shape == (4, 4):
         transform_two = ut.matrix_to_displacement_field(
             transform_one[..., 0], transform_two, spacing,
         )
 
-    # compose fields, return
+    # compose fields
     return compose_displacement_vector_fields(
         transform_one, transform_two, spacing,
     )
