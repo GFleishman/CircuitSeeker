@@ -3,97 +3,110 @@ import SimpleITK as sitk
 
 
 def configure_irm(
-    metric='MI',
-    bins=128,
-    sampling='regular',
-    sampling_percentage=1.0,
-    optimizer='GD',
-    iterations=200,
-    learning_rate=1.0,
-    estimate_learning_rate="once",
-    min_step=0.1,
-    max_step=1.0,
-    shrink_factors=[2,1],
-    smooth_sigmas=[2.,1.],
-    num_steps=[2, 2, 2],
-    step_sizes=[1., 1., 1.],
+    metric,
+    optimizer,
+    sampling,
+    interpolator,
+    shrink_factors,
+    smooth_sigmas,
+    metric_args={},
+    optimizer_args={},
+    sampling_percentage=None,
+    exhaustive_step_sizes=None,
     callback=None,
 ):
     """
-    Wrapper exposing some of the itk::simple::ImageRegistrationMethod API
+    Wrapper exposing the itk::simple::ImageRegistrationMethod API
     Rarely called by the user. Typically used in custom registration functions.
+    See SimpleITK documentation for itk::simple::ImageRegistrationMethod for details.
 
     Parameters
     ----------
-    metric : string (default: 'MI')
-        The image matching term optimized during alignment
+    metric : string
+        The image matching function optimized during alignment
+        Some options have required metric_args. See SimpleITK documentation for
+        itk::simple::ImageRegistrationMethod and look for SetMetricAs* functions
         Options:
-            'MI': mutual information
-            'CC': correlation coefficient
-            'MS': mean squares
+            'ANC':   AntsNiehborhoodCorrelation
+            'C':     Correlation
+            'D':     Demons
+            'JHMI':  JointHistogramMutualInformation
+            'MMI':   MattesMutualInformation
+            'MS':    MeanSquares
 
-    bins : int (default: 128)
-        Only used when `metric`='MI'. Number of histogram bins
-        for image intensity histograms. Ignored when `metric` is
-        'CC' or 'MS'
-
-    sampling : string (default: 'regular')
-        How image intensities are sampled during metric calculation
+    optimizer : string
+        Optimization algorithm used to improve metric and update transform
+        Some options have required optimizer_args. See SimpleITK documentation for
+        itk::simple::ImageRegistrationMethod and look for SetOptimizerAs* functions
         Options:
-            'regular': sample intensities with regular spacing
-            'random': sample intensities randomly
+            'A':        Amoeba
+            'CGLS':     ConjugateGradientLineSearch
+            'E':        Exhaustive
+            'GD':       GradientDescent
+            'GDLS':     GradientDescentLineSearch
+            'LBFGS2':   LimitedMemoryBroydenFletcherGoldfarbShannon w/o bounds
+            'LBFGSB':   LimitedMemoryBroydenFletcherGoldfardShannon w/ simple bounds
+            'OPOE':     OnePlueOneEvolutionary
+            'P':        Powell
+            'RSGD':     RegularStepGradientDescent
 
-    sampling_percentage : float in range [0., 1.] (default: 1.0)
-        Percentage of voxels used during metric sampling
-
-    optimizer : string (default 'GD')
-        Optimization algorithm used to find a transform
+    sampling : string
+        How image intensities are sampled in space during metric calculation
+        'REGULAR' and 'RANDOM' options influenced by 'sampling_percentage'
         Options:
-            'GD': gradient descent
-            'RGD': regular gradient descent
-            'EX': exhaustive - regular sampling of transform parameters between
-                  given limits
+            'NONE':     All voxels are used, values from voxel centers
+            'REGULAR':  Regular spacing between samples, small random perturbation from voxel centers
+            'RANDOM':   Sample positions are totally random
 
-    iterations : int (default: 200)
-        Maximum number of iterations at each scale level to run optimization.
-        Optimization may still converge early.
-
-    learning_rate : float (default: 1.0)
-        Initial gradient descent step size
-
-    estimate_learning_rate : string (default: "once")
-        Frequency of estimating the learning rate. Only used if `optimizer`='GD'
+    interpolator : string
+        Interpolation function used to compute image values at non-voxel center locations
+        See SimpleITK documentation for itk:simple Namespace Reference and search for
+        InterpolatorEnum
         Options:
-            'once': only estimate once at the beginning of optimization
-            'each_iteration': estimate step size at every iteration
-            'never': never estimate step size, `learning_rate` is fixed
+            '0':    NearestNeighbor,
+            '1':    Linear,
+            'BS1':  BSpline1,
+            'BS2':  BSpline2,
+            'BS3':  BSpline3,
+            'BS4':  BSpline4,
+            'BS5':  BSpline5,
+            'G':    Gaussian,
+            'LG':   LabelGaussian,
+            'HWS':  HammingWindowedSinc,
+            'CWS':  CosineWindowedSinc,
+            'WWS':  WelchWindowedSinc,
+            'LWS':  LanczosWindowedSinc,
+            'BWS':  BlackmanWindowedSinc,
 
-    min_step : float (default: 0.1)
-        Minimum allowable gradient descent step size. Only used if `optimizer`='RGD'
-
-    max_step : float (default: 1.0)
-        Maximum allowable gradient descent step size. Used by both 'GD' and 'RGD'
-
-    shrink_factors : iterable of type int (default: [2, 1])
+    shrink_factors : tuple of int
         Downsampling scale levels at which to optimize
 
-    smooth_sigmas : iterable of type float (default: [2., 1.])
+    smooth_sigmas : tuple of float
         Sigma of Gaussian used to smooth each scale level image
         Must be same length as `shrink_factors`
         Should be specified in physical units, e.g. mm or um
 
-    num_steps : iterable of type int (default: [2, 2, 2])
-        Only used if `optimizer`='EX'
-        Number of steps to search in each direction from the initial
-        position of the transform parameters
+    metric_args : dict (default: {})
+        Based on choice of metric, some additional arguments may be required.
+        Pass arguments to the metric function through this dictionary.
+        See itk::simple::ImageRegistrationMethod and look for SetMetricAs*
+        functions for valid arguments.
 
-    step_sizes : iterable of type float (default: [1., 1., 1.])
-        Only used if `optimizer`='EX'
-        Size of step to take during brute force optimization
-        Order of parameters and relevant scales should be based on
-        the type of transform being optimized
+    optimizer_args : dict (default: {})
+        Based on choice of optimizer, some additional arguments may be required.
+        Pass arguments to the optimizer function through this dictionary.
+        See itk::simple::ImageRegistrationMethod and look for SetOptimizerAs*
+        functions for valid arguments.
 
-    callable : callable object, e.g. function (default: None)
+    sampling_percentage : float in range [0., 1.] (default: None)
+        Required if sampling is 'REGULAR' or 'RANDOM'
+        Percentage of voxels used during metric sampling
+
+    exhaustive_step_sizes : tuple of float (default: None)
+        Required of optimizer is 'EXHAUSTIVE'
+        Grid search step sizes for each parameter in the transform
+
+    callback : callable object, e.g. function (default: None)
         A function run at every iteration of optimization
         Should take only the ImageRegistrationMethod object as input: `irm`
         If None then the Level, Iteration, and Metric values are
@@ -117,57 +130,67 @@ def configure_irm(
     irm = sitk.ImageRegistrationMethod()
     irm.SetNumberOfThreads(2*ncores)
 
-    # set interpolator
-    irm.SetInterpolator(sitk.sitkLinear)
+    # interpolator switch
+    interpolator_switch = {
+        '0':sitk.sitkNearestNeighbor,
+        '1':sitk.sitkLinear,
+        'BS1':sitk.sitkBSpline1,
+        'BS2':sitk.sitkBSpline2,
+        'BS3':sitk.sitkBSpline3,
+        'BS4':sitk.sitkBSpline4,
+        'BS5':sitk.sitkBSpline5,
+        'G':sitk.sitkGaussian,
+        'LG':sitk.sitkLabelGaussian,
+        'HWS':sitk.sitkHammingWindowedSinc,
+        'CWS':sitk.sitkCosineWindowedSinc,
+        'WWS':sitk.sitkWelchWindowedSinc,
+        'LWS':sitk.sitkLanczosWindowedSinc,
+        'BWS':sitk.sitkBlackmanWindowedSinc,
+    }
+    irm.SetInterpolator(interpolator_switch[interpolator])
 
-    # set metric
-    if metric == 'MI':
-        irm.SetMetricAsMattesMutualInformation(
-            numberOfHistogramBins=bins,
-        )
-    elif metric == 'CC':
-        irm.SetMetricAsCorrelation()
-    elif metric == 'MS':
-        irm.SetMetricAsMeanSquares()
+    # metric switch
+    metric_switch = {
+        'ANC':irm.SetMetricAsANTSNeighborhoodCorrelation,
+        'C':irm.SetMetricAsCorrelation,
+        'D':irm.SetMetricAsDemons,
+        'JHMI':irm.SetMetricAsJointHistogramMutualInformation,
+        'MMI':irm.SetMetricAsMattesMutualInformation,
+        'MS':irm.SetMetricAsMeanSquares,
+    }
+    metric_switch[metric](**metric_args)
 
-    # set metric sampling type and percentage
-    if sampling == 'regular':
-        irm.SetMetricSamplingStrategy(irm.REGULAR)
-    elif sampling == 'random':
-        irm.SetMetricSamplingStrategy(irm.RANDOM)
-    irm.SetMetricSamplingPercentage(sampling_percentage)
+    # sampling switch
+    sampling_switch = {
+        'NONE':irm.NONE,
+        'REGULAR':irm.REGULAR,
+        'RANDOM':irm.RANDOM,
+    }
+    irm.SetMetricSamplingStrategy(sampling_switch[sampling])
+    if sampling in ('REGULAR', 'RANDOM'):
+        irm.SetMetricSamplingPercentage(sampling_percentage)
 
-    # set estimate learning rate
-    if estimate_learning_rate == "never":
-        estimate_learning_rate = irm.Never
-    elif estimate_learning_rate == "once":
-        estimate_learning_rate = irm.Once
-    elif estimate_learning_rate == "each_iteration":
-        estimate_learning_rate = irm.EachIteration
-
-    # set optimizer
-    if optimizer == 'GD':
-        irm.SetOptimizerAsGradientDescent(
-            numberOfIterations=iterations,
-            learningRate=learning_rate,
-            maximumStepSizeInPhysicalUnits=max_step,
-            estimateLearningRate=estimate_learning_rate,
-        )
-        irm.SetOptimizerScalesFromPhysicalShift()
-    elif optimizer == 'RGD':
-        irm.SetOptimizerAsRegularStepGradientDescent(
-            minStep=min_step, learningRate=learning_rate,
-            numberOfIterations=iterations,
-            maximumStepSizeInPhysicalUnits=max_step,
-        )
-        irm.SetOptimizerScalesFromPhysicalShift()
-    elif optimizer == 'EX':
-        irm.SetOptimizerAsExhaustive(num_steps[::-1])
-        irm.SetOptimizerScales(step_sizes[::-1])
+    # optimizer switch
+    optimizer_switch = {
+        'A':irm.SetOptimizerAsAmoeba,
+        'CGLS':irm.SetOptimizerAsConjugateGradientLineSearch,
+        'E':irm.SetOptimizerAsExhaustive,
+        'GD':irm.SetOptimizerAsGradientDescent,
+        'GDLS':irm.SetOptimizerAsGradientDescentLineSearch,
+        'LBFGS2':irm.SetOptimizerAsLBFGS2,
+        'LBFGSB':irm.SetOptimizerAsLBFGSB,
+        'OPOE':irm.SetOptimizerAsOnePlusOneEvolutionary,
+        'P':irm.SetOptimizerAsPowell,
+        'RSGD':irm.SetOptimizerAsRegularStepGradientDescent,
+    }
+    optimizer_switch[optimizer](**optimizer_args)
+    irm.SetOptimizerScalesFromPhysicalShift()
+    if optimizer == 'E':
+        irm.SetOptimizerScales(exhaustive_step_sizes)
 
     # set pyramid
-    irm.SetShrinkFactorsPerLevel(shrinkFactors=shrink_factors)
-    irm.SetSmoothingSigmasPerLevel(smoothingSigmas=smooth_sigmas)
+    irm.SetShrinkFactorsPerLevel(shrink_factors)
+    irm.SetSmoothingSigmasPerLevel(smooth_sigmas)
     irm.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
 
     # set callback function
