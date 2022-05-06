@@ -65,9 +65,9 @@ def random_affine_search(
     mov_mask=None,
     fix_origin=None,
     mov_origin=None,
-    static_initial_moving_transform_list=[],
-    static_initial_moving_transform_spacing=None,
-    static_initial_moving_transform_origin=None,
+    static_moving_transform_list=[],
+    static_moving_transform_spacing=None,
+    static_moving_transform_origin=None,
     use_patch_mutual_information=False,
     print_running_improvements=False,
     **kwargs,
@@ -141,15 +141,15 @@ def random_affine_search(
         Origin of the moving image.
         Length must equal `mov.ndim`
 
-    static_initial_moving_transform_list : list of numpy arrays (default: [])
+    static_moving_transform_list : list of numpy arrays (default: [])
         Transforms applied to moving image before applying query transform
 
-    static_initial_moving_transform_spacing : np.ndarray or tuple of np.ndarray (default: None)
-        Spacing of transforms in static_initial_moving_transform_list
+    static_moving_transform_spacing : np.ndarray or tuple of np.ndarray (default: None)
+        Spacing of transforms in static_moving_transform_list
         Only necessary for displacement field transforms.
 
-    static_initial_moving_transform_origin : np.ndarray or tuple of np.ndarray (default: None)
-        Origin of transforms in static_initial_moving_transform_list
+    static_moving_transform_origin : np.ndarray or tuple of np.ndarray (default: None)
+        Origin of transforms in static_moving_transform_list
         Only necessary for displacement field transforms.
 
     use_patch_mutual_information : bool (default: False)
@@ -205,29 +205,27 @@ def random_affine_search(
     # define conversion from params to affine transform matrix
     def params_to_affine_matrix(params):
         # translation
-        translation = np.eye(4)
-        translation[:3, -1] = params[:3]
+        aff = np.eye(4)
+        aff[:3, -1] = params[:3]
         # rotation
-        rotation = np.eye(4)
-        rotation[:3, :3] = Rotation.from_rotvec(params[3:6]).as_matrix()
+        x = np.eye(4)
+        x[:3, :3] = Rotation.from_rotvec(params[3:6]).as_matrix()
         center = np.array(fix.shape) / 2 * fix_spacing
         tl, tr = np.eye(4), np.eye(4)
         tl[:3, -1], tr[:3, -1] = center, -center
-        rotation = np.matmul(tl, np.matmul(rotation, tr))
+        x = np.matmul(tl, np.matmul(x, tr))
+        aff = np.matmul(x, aff)
         # scale
-        scale = np.diag(tuple(params[6:9]) + (1,))
+        x = np.diag(tuple(params[6:9]) + (1,))
+        aff = np.matmul(x, aff)
         # shear
         shx, shy, shz = np.eye(4), np.eye(4), np.eye(4)
         shx[1, 0], shx[2, 0] = params[10], params[11]
         shy[0, 1], shy[2, 1] = params[9], params[11]
         shz[0, 2], shz[1, 2] = params[9], params[10]
-        shear = np.matmul(shz, np.matmul(shy, shx))
-        # compose
-        aff = np.matmul(rotation, translation)
-        aff = np.matmul(scale, aff)
-        aff = np.matmul(shear, aff)
-        return aff
-        
+        x = np.matmul(shz, np.matmul(shy, shx))
+        return np.matmul(x, aff)
+ 
     # skip sample to alignment spacing
     if alignment_spacing:
         fix, mov, fix_mask, mov_mask, fix_spacing, mov_spacing = skip_sample_image(
@@ -242,22 +240,27 @@ def random_affine_search(
         # wrap patch_mi metric
         def score_affine(affine):
             # apply transform
+            transform_list = static_moving_transforms_list + [affine,]
             aligned = apply_transform(
                 fix, mov, fix_spacing, mov_spacing,
-                transform_list=[affine,],
+                transform_list=transform_list,
                 fix_origin=fix_origin,
                 mov_origin=mov_origin,
+                transform_spacing=static_moving_transform_spacing,
+                transform_origin=static_moving_transform_origin,
             )
-            # mov mask
             mov_mask_aligned = None
             if mov_mask:
                 mov_mask_aligned = apply_transform(
                     fix, mov_mask, fix_spacing, mov_spacing,
-                    transform_list=[affine,],
+                    transform_list=transform_list,
                     fix_origin=fix_origin,
                     mov_origin=mov_origin,
+                    transform_spacing=static_moving_transform_spacing,
+                    transform_origin=static_moving_transform_origin,
                     interpolate_with_nn=True,
                 )
+            # evaluate metric
             return patch_mutual_information(
                 fix, aligned, fix_spacing,
                 fix_mask=fix_mask,
@@ -276,16 +279,17 @@ def random_affine_search(
         )
         if fix_mask: irm.SetMetricFixedMask(fix_mask)
         if mov_mask: irm.SetMetricMovingMask(mov_mask)
-        T = transform_list_to_composite_transform(
-            static_initial_moving_transforms_list,
-            static_initial_moving_transform_spacing,
-            static_initial_moving_transform_origin,
-        )
-        irm.SetMovingInitialTransform(T)
+        if static_moving_transforms_list:
+            T = transform_list_to_composite_transform(
+                static_moving_transforms_list,
+                static_moving_transform_spacing,
+                static_moving_transform_origin,
+            )
+            irm.SetMovingInitialTransform(T)
 
         # wrap irm metric
         def score_affine(affine):
-            irm.SetMovingInitialTransform(ut.matrix_to_affine_transform(affine))
+            irm.SetInitialTransform(ut.matrix_to_affine_transform(affine))
             try:
                 return irm.MetricEvaluate(fix, mov)
             except Exception as e:
@@ -319,11 +323,10 @@ def affine_align(
     mov_mask=None,
     fix_origin=None,
     mov_origin=None,
-    static_initial_moving_transform_list=[],
-    static_initial_moving_transform_spacing=None,
-    static_initial_moving_transform_origin=None,
-    use_patch_mutual_information=False,
-    default=np.eye(4),
+    static_moving_transform_list=[],
+    static_moving_transform_spacing=None,
+    static_moving_transform_origin=None,
+    default=None,
     **kwargs,
 ):
     """
@@ -352,13 +355,11 @@ def affine_align(
     rigid : bool (default: False)
         Restrict the alignment to rigid motion only
 
-    initial_transform : 4x4 array (default: None)
-        An initial rigid or affine matrix from which to initialize
-        the optimization
-
-    initialize_with_center : bool (default: False)
-        Initialize the optimization center of mass translation
-        Cannot be True if `initial_transform` is not None
+    initial_condition : str or 4x4 ndarray (default: None)
+        How to begin the optimization. Only one string value is allowed:
+        "CENTER" in which case the alignment is initialized by a center
+        of mass alignment. If a 4x4 ndarray is given the optimization
+        is initialized with that transform.
 
     alignment_spacing : float (default: None)
         Fixed and moving images are skip sampled to a voxel spacing
@@ -379,12 +380,16 @@ def affine_align(
         Origin of the moving image.
         Length must equal `mov.ndim`
 
-    jaccard_filter_threshold : float in range [0, 1] (default: None)
-        If `jaccard_filter_threshold`, `fix_mask`, and `mov_mask` are all
-        defined (i.e. not None), then the Jaccard index between the masks
-        is computed. If the index is less than this threshold the alignment
-        is skipped and the default is returned. Useful for distributed piecewise
-        workflows over heterogenous data.
+    static_moving_transform_list : list of numpy arrays (default: [])
+        Transforms applied to moving image before applying query transform
+
+    static_moving_transform_spacing : np.ndarray or tuple of np.ndarray (default: None)
+        Spacing of transforms in static_moving_transform_list
+        Only necessary for displacement field transforms.
+
+    static_moving_transform_origin : np.ndarray or tuple of np.ndarray (default: None)
+        Origin of transforms in static_moving_transform_list
+        Only necessary for displacement field transforms.
 
     default : 4x4 array (default: identity matrix)
         If the optimization fails, print error message but return this value
@@ -400,17 +405,17 @@ def affine_align(
         The affine or rigid transform matrix matching moving to fixed
     """
 
-    # update default if an initial transform is provided
+    # determine the correct default
+    if not default: default = np.eye(fix.ndim + 1)
     initial_transform_given = isinstance(initial_condition, np.ndarray)
-    if initial_transform_given and np.all(default == np.eye(4)):
+    if initial_transform_given and np.all(default == np.eye(fix.ndim + 1)):
         default = initial_condition
 
-    # skip sample to alignment spacing
+    # skip sample and convert inputs to sitk images
     if alignment_spacing:
         fix, mov, fix_mask, mov_mask, fix_spacing, mov_spacing = skip_sample_image(
             fix, mov, fix_mask, mov_mask, fix_spacing, mov_spacing, alignment_spacing,
         )
-
     fix, mov, fix_mask, mov_mask = images_to_sitk(
         fix, mov, fix_mask, mov_mask, fix_spacing, mov_spacing, fix_origin, mov_origin,
     )
@@ -418,12 +423,13 @@ def affine_align(
     # set up registration object
     irm = configure_irm(**kwargs)
     # set initial static transforms
-    T = transform_list_to_composite_transform(
-        static_initial_moving_transforms_list,
-        static_initial_moving_transform_spacing,
-        static_initial_moving_transform_origin,
-    )
-    irm.SetMovingInitialTransform(T)
+    if static_moving_transforms_list:
+        T = transform_list_to_composite_transform(
+            static_moving_transforms_list,
+            static_moving_transform_spacing,
+            static_moving_transform_origin,
+        )
+        irm.SetMovingInitialTransform(T)
     # set transform to optimize
     if rigid and not initial_transform_given:
         transform = sitk.Euler3DTransform()
@@ -479,9 +485,9 @@ def deformable_align(
     mov_mask=None,
     fix_origin=None,
     mov_origin=None,
-    static_initial_moving_transform_list=[],
-    static_initial_moving_transform_spacing=None,
-    static_initial_moving_transform_origin=None,
+    static_moving_transform_list=[],
+    static_moving_transform_spacing=None,
+    static_moving_transform_origin=None,
     default=None,
     **kwargs,
 ):
@@ -519,10 +525,6 @@ def deformable_align(
         points spacing, then optimize again at 200.0 units, then again
         at the requested 100.0 units control point spacing.
     
-    initial_transform : 4x4 array (default: None)
-        An initial rigid or affine matrix from which to initialize
-        the optimization
-
     alignment_spacing : float (default: None)
         Fixed and moving images are skip sampled to a voxel spacing
         as close as possible to this value. Intended for very fast
@@ -542,12 +544,16 @@ def deformable_align(
         Origin of the moving image.
         Length must equal `mov.ndim`
 
-    jaccard_filter_threshold : float in range [0, 1] (default: None)
-        If `jaccard_filter_threshold`, `fix_mask`, and `mov_mask` are all
-        defined (i.e. not None), then the Jaccard index between the masks
-        is computed. If the index is less than this threshold the alignment
-        is skipped and the default is returned. Useful for distributed piecewise
-        workflows over heterogenous data.
+    static_moving_transform_list : list of numpy arrays (default: [])
+        Transforms applied to moving image before applying query transform
+
+    static_moving_transform_spacing : np.ndarray or tuple of np.ndarray (default: None)
+        Spacing of transforms in static_moving_transform_list
+        Only necessary for displacement field transforms.
+
+    static_moving_transform_origin : np.ndarray or tuple of np.ndarray (default: None)
+        Origin of transforms in static_moving_transform_list
+        Only necessary for displacement field transforms.
 
     default : any object (default: None)
         If optimization fails to improve image matching metric,
@@ -574,53 +580,45 @@ def deformable_align(
     # store initial fixed image shape
     initial_fix_shape = fix.shape
 
-    # skip sample to alignment spacing
+    # skip sample and convert inputs to sitk images
     if alignment_spacing:
         fix, mov, fix_mask, mov_mask, fix_spacing, mov_spacing = skip_sample_image(
             fix, mov, fix_mask, mov_mask, fix_spacing, mov_spacing, alignment_spacing,
         )
-
-    # convert to sitk images, float32 type
     fix, mov, fix_mask, mov_mask = images_to_sitk(
         fix, mov, fix_mask, mov_mask, fix_spacing, mov_spacing, fix_origin, mov_origin,
     )
 
     # set up registration object
     irm = configure_irm(**kwargs)
-    # set initial static transforms
-    T = transform_list_to_composite_transform(
-        static_initial_moving_transforms_list,
-        static_initial_moving_transform_spacing,
-        static_initial_moving_transform_origin,
-    )
-    irm.SetMovingInitialTransform(T)
-
-    # get control point grid shape
-    fix_size_physical = [sz*sp for sz, sp in zip(fix.GetSize(), fix.GetSpacing())]
-    x, y = control_point_spacing, control_point_levels[-1]
-    control_point_grid = [max(1, int(sz / (x*y))) for sz in fix_size_physical]
-
-    # set initial transform
+    # initial control point grid
+    z = control_point_spacing * control_point_levels[-1]
+    initial_cp_grid = [max(1, int(x*y/z)) for x, y in zip(fix.GetSize(), fix.GetSpacing())]
     transform = sitk.BSplineTransformInitializer(
-        image1=fix, transformDomainMeshSize=control_point_grid, order=3,
+        image1=fix, transformDomainMeshSize=initial_cp_grid, order=3,
     )
     irm.SetInitialTransformAsBSpline(
         transform, inPlace=True, scaleFactors=control_point_levels,
     )
+    # set initial static transforms
+    if static_moving_transforms_list:
+        T = transform_list_to_composite_transform(
+            static_moving_transforms_list,
+            static_moving_transform_spacing,
+            static_moving_transform_origin,
+        )
+        irm.SetMovingInitialTransform(T)
+    # set masks
+    if fix_mask: irm.SetMetricFixedMask(fix_mask)
+    if mov_mask: irm.SetMetricMovingMask(mov_mask)
 
-    # store initial transform coordinates as default
+    # now we can set the default
     if not default:
-        a = transform.GetFixedParameters()
-        b = transform.GetParameters()
-        params = np.concatenate((a, b))
+        params = np.concatenate((transform.GetFixedParameters(), transform.GetParameters()))
         field = ut.bspline_to_displacement_field(
             fix, transform, shape=initial_fix_shape,
         )
         default = (params, field)
-
-    # set masks
-    if fix_mask: irm.SetMetricFixedMask(fix_mask)
-    if mov_mask: irm.SetMetricMovingMask(mov_mask)
 
     # execute alignment, for any exceptions return default
     try:
@@ -635,9 +633,7 @@ def deformable_align(
     # if registration improved metric return result
     # otherwise return default
     if final_metric_value < initial_metric_value:
-        a = transform.GetFixedParameters()
-        b = transform.GetParameters()
-        params = np.concatenate((a, b))
+        params = np.concatenate((transform.GetFixedParameters(), transform.GetParameters()))
         field = ut.bspline_to_displacement_field(
             fix, transform, shape=initial_fix_shape,
         )
@@ -656,11 +652,13 @@ def alignment_pipeline(
     fix_spacing,
     mov_spacing,
     steps,
-    initial_transform=None,
     fix_mask=None,
     mov_mask=None,
     fix_origin=None,
     mov_origin=None,
+    static_moving_transform_list=[],
+    static_moving_transform_spacing=None,
+    static_moving_transform_origin=None,
     random_kwargs={},
     rigid_kwargs={},
     affine_kwargs={},
@@ -693,13 +691,7 @@ def alignment_pipeline(
         'rigid' : run `affine_align` with `rigid=True`
         'affine' : run `affine_align`
         'deform' : run `deformable_align`
-
-        Currently you cannot run 'random' and 'rigid' in the same pipeline.
-        Hoping to enable this in the future.
-
-    initial_transform : ndarray (default: None)
-        An initial transform. This should be a 4x4 affine matrix.
-        Not compatible with 'random' in `steps`
+        Steps can only be run in this order. Omissions are ok, e.g. ['random', 'affine']
 
     fix_mask : binary ndarray (default: None)
         A mask limiting metric evaluation region of the fixed image
@@ -714,6 +706,17 @@ def alignment_pipeline(
     mov_origin : 1d array (default: None)
         Origin of the moving image.
         Length must equal `mov.ndim`
+
+    static_moving_transform_list : list of numpy arrays (default: [])
+        Transforms applied to moving image before applying query transform
+
+    static_moving_transform_spacing : np.ndarray or tuple of np.ndarray (default: None)
+        Spacing of transforms in static_moving_transform_list
+        Only necessary for displacement field transforms.
+
+    static_moving_transform_origin : np.ndarray or tuple of np.ndarray (default: None)
+        Origin of transforms in static_moving_transform_list
+        Only necessary for displacement field transforms.
 
     random_kwargs : dict (default: None)
         Arguments passed to `random_affine_search`
@@ -742,26 +745,19 @@ def alignment_pipeline(
         steps ('random', 'rigid', and/or 'affine') are composed.
 
         If 'deform' is in `steps` then this is a tuple. The first element
-        is the composed 4x4 affine matrix, the second is a displacement
+        is the composed 4x4 affine matrix, the second is the output of
+        deformable align: a tuple with the bspline parameters and the
         vector field with shape equal to fix.shape + (3,)
     """
-
-    # TODO: rigid could be done before random, but random would
-    #       need to support an initial_transform; possible
-    #       with matrix multiplication (composition)
-    if 'random' in steps and 'rigid' in steps:
-        message = "cannot do rigid alignment after random affine\n"
-        message += "remove either 'random' or 'rigid' from steps"
-        raise ValueError(message)
-
-    # set default
-    affine = initial_transform if initial_transform is not None else np.eye(4)
 
     # establish all keyword arguments
     random_kwargs = {**kwargs, **random_kwargs}
     rigid_kwargs = {**kwargs, **rigid_kwargs}
     affine_kwargs = {**kwargs, **affine_kwargs}
     deform_kwargs = {**kwargs, **deform_kwargs}
+
+    # let default be identity
+    affine = np.eye(fix.ndim + 1)
 
     # random initialization
     if 'random' in steps:
@@ -772,35 +768,48 @@ def alignment_pipeline(
             mov_mask=mov_mask,
             fix_origin=fix_origin,
             mov_origin=mov_origin,
+            static_moving_transform_list=static_moving_transform_list,
+            static_moving_transform_spacing=static_moving_transform_spacing,
+            static_moving_transform_origin=static_moving_transform_origin,
             **random_kwargs,
          )
     # rigid alignment
     if 'rigid' in steps:
+        if 'random' in steps:
+            static_moving_transform_list += [affine,]
         affine = affine_align(
             fix, mov,
             fix_spacing, mov_spacing,
+            rigid=True,
             fix_mask=fix_mask,
             mov_mask=mov_mask,
             fix_origin=fix_origin,
             mov_origin=mov_origin,
-            initial_transform=affine,
-            rigid=True,
+            static_moving_transform_list=static_moving_transform_list,
+            static_moving_transform_spacing=static_moving_transform_spacing,
+            static_moving_transform_origin=static_moving_transform_origin,
             **rigid_kwargs,
         )
+        if 'random' in steps:
+            affine = np.matmul(static_moving_transform_list.pop(-1), affine)
     # affine alignment
     if 'affine' in steps:
         affine = affine_align(
             fix, mov,
             fix_spacing, mov_spacing,
+            initial_condition=affine,
             fix_mask=fix_mask,
             mov_mask=mov_mask,
             fix_origin=fix_origin,
             mov_origin=mov_origin,
-            initial_transform=affine,
+            static_moving_transform_list=static_moving_transform_list,
+            static_moving_transform_spacing=static_moving_transform_spacing,
+            static_moving_transform_origin=static_moving_transform_origin,
             **affine_kwargs,
         )
     # deformable align
     if 'deform' in steps:
+        static_moving_transform_list += [affine,]
         deform = deformable_align(
             fix, mov,
             fix_spacing, mov_spacing,
@@ -808,7 +817,9 @@ def alignment_pipeline(
             mov_mask=mov_mask,
             fix_origin=fix_origin,
             mov_origin=mov_origin,
-            initial_transform=affine,
+            static_moving_transform_list=static_moving_transform_list,
+            static_moving_transform_spacing=static_moving_transform_spacing,
+            static_moving_transform_origin=static_moving_transform_origin,
             **deform_kwargs,
         )
         return affine, deform
