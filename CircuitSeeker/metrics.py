@@ -25,58 +25,32 @@ def patch_mutual_information(
     mov_sitk = ut.numpy_to_sitk(mov.transpose(2, 1, 0), spacing[::-1])
     mov_sitk = sitk.Cast(mov_sitk, sitk.sitkFloat32)
 
-    # convert to voxel units
-    radius = np.round(radius / spacing).astype(np.uint16)
-    stride = np.round(stride / spacing).astype(np.uint16)
-
     # determine patch sample centers
     samples = np.zeros_like(fix)
-    sample_points = tuple(slice(r, -r, s) for r, s in zip(radius, stride))
-    samples[sample_points] = 1
-
-    # mask sample points
+    radius = np.round(radius / spacing).astype(np.uint16)
+    stride = np.round(stride / spacing).astype(np.uint16)
+    samples[tuple(slice(r, -r, s) for r, s in zip(radius, stride))] = 1
     if fix_mask is not None: samples = samples * fix_mask
     if mov_mask is not None: samples = samples * mov_mask
-
-    # convert to list of coordinates
     samples = np.column_stack(np.nonzero(samples))
 
-    # we'll use an irm for metric, set metric/irm defauls
-    kwargs['metric'] = 'MMI'
-    if 'metric_args' not in kwargs:
-        kwargs['metric_args'] = {'numberOfHistogramBins':32}
-    if 'sampling' not in kwargs:
-        kwargs['sampling'] = 'NONE'
-    # next param only matters if sampling is 'REGULAR' or 'RANDOM'
-    if 'interpolator' not in kwargs:
-        kwargs['interpolator'] = '1'
-    # following arguments are totally unused, values are irrelevant
-    kwargs['optimizer'] = 'A'
-    kwargs['shrink_factors'] = (1,)
-    kwargs['smooth_sigmas'] = (1,)
-    
-    # create irm for evaluating metric
+    # create irm and containers for results
     irm = configure_irm(**kwargs)
-
-    # create container for metric image
     if return_metric_image:
         metric_image = np.zeros(fix.shape, dtype=np.float32)
-
-    # loop over patches and evaluate
     scores = []
-    for sample in samples:
 
+    # score all blocks
+    for sample in samples:
         # get patches
         patch = tuple(slice(s-r, s+r+1) for s, r in zip(sample, radius))
         f = fix_sitk[patch]
         m = mov_sitk[patch]
-
         # evaluate metric
         try:
             scores.append( irm.MetricEvaluate(f, m) )
         except Exception as e:
             scores.append( 0 )
-
         # update metric image
         if return_metric_image:
             metric_image[patch] = scores[-1]
