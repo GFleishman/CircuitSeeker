@@ -148,6 +148,24 @@ def bspline_to_displacement_field(reference, bspline, shape=None):
     return df
 
 
+def transform_list_to_composite_transform(transform_list, spacing=None, origin=None):
+    """
+    """
+
+    transform = sitk.CompositeTransform(3)
+    for iii, t in enumerate(transform_list):
+        if t.shape == (4, 4):
+            t = matrix_to_affine_transform(t)
+        elif len(t.shape) == 1:
+            t = bspline_parameters_to_transform(t)
+        else:
+            a = spacing[iii] if isinstance(spacing, tuple) else spacing
+            b = origin[iii] if isinstance(origin, tuple) else origin
+            t = field_to_displacement_field_transform(t, a, b)
+        transform.AddTransform(t)
+    return transform
+
+
 def scatter_dask_array(cluster, array):
     """
     """
