@@ -23,8 +23,8 @@ def skip_sample_images(
 
     fix, fix_spacing_ss = ut.skip_sample(fix, fix_spacing, alignment_spacing)
     mov, mov_spacing_ss = ut.skip_sample(mov, mov_spacing, alignment_spacing)
-    if fix_mask: fix_mask, _ = ut.skip_sample(fix_mask, fix_spacing, alignment_spacing)
-    if mov_mask: mov_mask, _ = ut.skip_sample(mov_mask, mov_spacing, alignment_spacing)
+    if fix_mask is not None: fix_mask, _ = ut.skip_sample(fix_mask, fix_spacing, alignment_spacing)
+    if mov_mask is not None: mov_mask, _ = ut.skip_sample(mov_mask, mov_spacing, alignment_spacing)
     return fix, mov, fix_mask, mov_mask, fix_spacing_ss, mov_spacing_ss
 
 
@@ -44,8 +44,8 @@ def images_to_sitk(
 
     fix = sitk.Cast(ut.numpy_to_sitk(fix, fix_spacing, origin=fix_origin), sitk.sitkFloat32)
     mov = sitk.Cast(ut.numpy_to_sitk(mov, mov_spacing, origin=mov_origin), sitk.sitkFloat32)
-    if fix_mask: fix_mask = ut.numpy_to_sitk(fix_mask, fix_spacing, origin=fix_origin)
-    if mov_mask: mov_mask = ut.numpy_to_sitk(mov_mask, mov_spacing, origin=mov_origin)
+    if fix_mask is not None: fix_mask = ut.numpy_to_sitk(fix_mask, fix_spacing, origin=fix_origin)
+    if mov_mask is not None: mov_mask = ut.numpy_to_sitk(mov_mask, mov_spacing, origin=mov_origin)
     return fix, mov, fix_mask, mov_mask
 
 
@@ -188,10 +188,10 @@ def random_affine_search(
         max_rotation = expand_param_to_3d(max_rotation, 0)
         max_scale = expand_param_to_3d(max_scale, 1)
         max_shear = expand_param_to_3d(max_shear, 0)
-        if fix_mask: fix_mask = fix_mask.reshape(fix_mask.shape + (1,))
-        if mov_mask: mov_mask = mov_mask.reshape(mov_mask.shape + (1,))
-        if fix_origin: fix_origin = tuple(fix_origin) + (0.,)
-        if mov_origin: mov_origin = tuple(mov_origin) + (0.,)
+        if fix_mask is not None: fix_mask = fix_mask.reshape(fix_mask.shape + (1,))
+        if mov_mask is not None: mov_mask = mov_mask.reshape(mov_mask.shape + (1,))
+        if fix_origin is not None: fix_origin = tuple(fix_origin) + (0.,)
+        if mov_origin is not None: mov_origin = tuple(mov_origin) + (0.,)
 
     # generate random parameters, first row is always identity
     params = np.zeros((random_iterations+1, 12))
@@ -250,7 +250,7 @@ def random_affine_search(
                 transform_origin=static_moving_transform_origin,
             )
             mov_mask_aligned = None
-            if mov_mask:
+            if mov_mask is not None:
                 mov_mask_aligned = apply_transform(
                     fix, mov_mask, fix_spacing, mov_spacing,
                     transform_list=transform_list,
@@ -277,8 +277,8 @@ def random_affine_search(
             fix, mov, fix_mask, mov_mask,
             fix_spacing, mov_spacing, fix_origin, mov_origin,
         )
-        if fix_mask: irm.SetMetricFixedMask(fix_mask)
-        if mov_mask: irm.SetMetricMovingMask(mov_mask)
+        if fix_mask is not None: irm.SetMetricFixedMask(fix_mask)
+        if mov_mask is not None: irm.SetMetricMovingMask(mov_mask)
         if static_moving_transforms_list:
             T = transform_list_to_composite_transform(
                 static_moving_transforms_list,
@@ -443,8 +443,8 @@ def affine_align(
         transform = sitk.CenteredTransformInitializer(fix, mov, transform)
     irm.SetInitialTransform(transform, inPlace=True)
     # set masks
-    if fix_mask: irm.SetMetricFixedMask(fix_mask)
-    if mov_mask: irm.SetMetricMovingMask(mov_mask)
+    if fix_mask is not None: irm.SetMetricFixedMask(fix_mask)
+    if mov_mask is not None: irm.SetMetricMovingMask(mov_mask)
 
     # execute alignment, for any exceptions return default
     try:
@@ -609,8 +609,8 @@ def deformable_align(
         )
         irm.SetMovingInitialTransform(T)
     # set masks
-    if fix_mask: irm.SetMetricFixedMask(fix_mask)
-    if mov_mask: irm.SetMetricMovingMask(mov_mask)
+    if fix_mask is not None: irm.SetMetricFixedMask(fix_mask)
+    if mov_mask is not None: irm.SetMetricMovingMask(mov_mask)
 
     # now we can set the default
     if not default:
