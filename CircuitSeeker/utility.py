@@ -14,13 +14,13 @@ def skip_sample(image, spacing, ss_spacing):
     """
     """
 
+    spacing = np.array(spacing)
     ss = np.maximum(np.round(ss_spacing / spacing), 1).astype(np.int)
-    image = image[::ss[0], ::ss[1], ::ss[2]]
-    spacing = spacing * ss
-    return image, spacing
+    slc = tuple(slice(None, None, x) for x in ss)
+    return image[slc], spacing * ss
 
 
-def numpy_to_sitk(image, spacing, origin=None, vector=False):
+def numpy_to_sitk(image, spacing=None, origin=None, vector=False):
     """
     """
 
@@ -32,9 +32,9 @@ def numpy_to_sitk(image, spacing, origin=None, vector=False):
         raise TypeError(error)
 
     image = sitk.GetImageFromArray(image, isVector=vector)
+    if spacing is None: spacing = np.ones(image.ndim)
     image.SetSpacing(spacing[::-1])
-    if origin is None:
-        origin = np.zeros(len(spacing))
+    if origin is None: origin = np.zeros(image.ndim)
     image.SetOrigin(origin[::-1])
     return image
 
@@ -47,6 +47,16 @@ def invert_matrix_axes(matrix):
     corrected[:3, :3] = matrix[:3, :3][::-1, ::-1]
     corrected[:3, -1] = matrix[:3, -1][::-1]
     return corrected
+
+
+def change_affine_matrix_origin(matrix, origin):
+    """
+    """
+
+    tl, tr = np.eye(4), np.eye(4)
+    origin = np.array(origin)
+    tl[:3, -1], tr[:3, -1] = origin, -origin
+    return np.matmul(tl, np.matmul(matrix, tr))
 
 
 def affine_transform_to_matrix(transform):
@@ -102,23 +112,24 @@ def parameters_to_euler_transform(params):
     return transform
 
 
-def matrix_to_displacement_field(reference, matrix, spacing):
+def matrix_to_displacement_field(matrix, shape, spacing=None):
     """
     """
 
-    nrows, ncols, nstacks = reference.shape
-    grid = np.array(np.mgrid[:nrows, :ncols, :nstacks]).transpose(1,2,3,0)
-    grid = grid * spacing
+    if spacing is None: spacing = np.ones(len(shape))
+    nrows, ncols, nstacks = shape
+    grid = np.array(np.mgrid[:nrows, :ncols, :nstacks])
+    grid = grid.transpose(1,2,3,0) * spacing
     mm, tt = matrix[:3, :3], matrix[:3, -1]
     return np.einsum('...ij,...j->...i', mm, grid) + tt - grid
 
 
-def field_to_displacement_field_transform(field, spacing, origin=None):
+def field_to_displacement_field_transform(field, spacing=None, origin=None):
     """
     """
 
     field = field.astype(np.float64)[..., ::-1]
-    transform = numpy_to_sitk(field, spacing, vector=True, origin=origin)
+    transform = numpy_to_sitk(field, spacing, origin, vector=True)
     return sitk.DisplacementFieldTransform(transform)
 
 
@@ -164,18 +175,6 @@ def transform_list_to_composite_transform(transform_list, spacing=None, origin=N
             t = field_to_displacement_field_transform(t, a, b)
         transform.AddTransform(t)
     return transform
-
-
-def scatter_dask_array(cluster, array):
-    """
-    """
-
-    if not isinstance(array, dask.array.Array):
-        future = cluster.client.scatter(array)
-        da = dask.array.from_delayed(future, shape=array.shape, dtype=array.dtype)
-        return da
-    else:
-        return array
 
 
 def create_zarr(path, shape, chunks, dtype, chunk_locked=False, client=None):
