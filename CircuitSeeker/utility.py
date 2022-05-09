@@ -1,9 +1,5 @@
 import numpy as np
 import SimpleITK as sitk
-import functools
-import ClusterWrap
-import dask
-from scipy.ndimage import zoom
 import zarr
 from zarr.indexing import BasicIndexer
 from numcodecs import Blosc
@@ -15,7 +11,7 @@ def skip_sample(image, spacing, ss_spacing):
     """
 
     spacing = np.array(spacing)
-    ss = np.maximum(np.round(ss_spacing / spacing), 1).astype(np.int)
+    ss = np.maximum(np.round(ss_spacing / spacing), 1).astype(int)
     slc = tuple(slice(None, None, x) for x in ss)
     return image[slc], spacing * ss
 
@@ -32,9 +28,9 @@ def numpy_to_sitk(image, spacing=None, origin=None, vector=False):
         raise TypeError(error)
 
     image = sitk.GetImageFromArray(image, isVector=vector)
-    if spacing is None: spacing = np.ones(image.ndim)
+    if spacing is None: spacing = np.ones(image.GetDimension())
     image.SetSpacing(spacing[::-1])
-    if origin is None: origin = np.zeros(image.ndim)
+    if origin is None: origin = np.zeros(image.GetDimension())
     image.SetOrigin(origin[::-1])
     return image
 
@@ -143,20 +139,21 @@ def bspline_parameters_to_transform(parameters):
     return t
 
 
-def bspline_to_displacement_field(reference, bspline, shape=None):
+def bspline_to_displacement_field(
+    bspline, shape, spacing=None, origin=None, direction=None,
+):
     """
     """
 
+    if spacing is None: spacing = np.ones(len(shape))
+    if origin is None: origin = np.zeros(len(shape))
+    if direction is None: direction = np.eye(len(shape))
     df = sitk.TransformToDisplacementField(
         bspline, sitk.sitkVectorFloat64,
-        reference.GetSize(), reference.GetOrigin(),
-        reference.GetSpacing(), reference.GetDirection(),
+        shape[::-1], origin[::-1], spacing[::-1],
+        direction[::-1, ::-1].ravel(),
     )
-    df = sitk.GetArrayFromImage(df).astype(np.float32)[..., ::-1]
-    if shape is not None:
-        new_shape = [x / y for x, y in zip(shape, df.shape[:-1])] + [1,]
-        df = zoom(df, new_shape, order=1, mode='nearest')
-    return df
+    return sitk.GetArrayFromImage(df).astype(np.float32)[..., ::-1]
 
 
 def transform_list_to_composite_transform(transform_list, spacing=None, origin=None):
@@ -192,6 +189,8 @@ def create_zarr(path, shape, chunks, dtype, chunk_locked=False, client=None):
         compressor=compressor,
     )
 
+    # this code is currently never used within CircuitSeeker
+    # keeping it aroung in case a use case comes up
     if chunk_locked:
         indexer = BasicIndexer(slice(None), zarr_disk)
         keys = (zarr_disk._chunk_key(idx.chunk_coords) for idx in indexer)
