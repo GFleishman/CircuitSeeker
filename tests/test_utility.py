@@ -1,7 +1,50 @@
 import numpy as np
 import SimpleITK as sitk
 import zarr, os, tempfile
+from pytest import fixture
 import CircuitSeeker.utility as ut
+
+
+@fixture
+def dummy_affine_matrix():
+    """
+    """
+
+    matrix = np.arange(16).reshape((4,4))
+    matrix[3] = [0, 0, 0, 1]
+    return matrix
+
+
+@fixture
+def dummy_scale_translate_matrix():
+    """
+    """
+
+    scale, trans = (2, 3, 4), (2, 4, 6)
+    matrix = np.diag(scale + (1,))
+    matrix[:3, -1] = trans
+    return matrix
+
+
+@fixture
+def dummy_bspline_params():
+    """
+    """
+
+    a = (4,)*3    # mesh_size
+    b = (-1,)*3   # mesh_origin
+    c = (1,)*3    # mesh_spacing
+    d = np.eye(3).ravel()    # mesh_directions
+    e = np.ones(np.prod(a) * 3) * 6    #coefficients
+    return np.concatenate((a, b, c, d, e))
+
+
+@fixture
+def dummy_vector_field():
+    """
+    """
+
+    return np.ones((10,)*3 + (3,)) * 12
 
 
 def test_skip_sample():
@@ -14,55 +57,48 @@ def test_skip_sample():
     assert np.all(spacing == (2, 3, 1))
     
 
-def test_numpy_to_sitk():
+def test_numpy_to_sitk(dummy_vector_field):
     """
     """
 
-    image = np.arange(20**3 * 3).reshape((20,)*3 + (3,))
-    sitk_image = ut.numpy_to_sitk(image, (1,)*3, (0,)*3, vector=True)
+    sitk_image = ut.numpy_to_sitk(dummy_vector_field, (1,)*3, (0,)*3, vector=True)
     result = sitk.GetArrayFromImage(sitk_image)
     assert isinstance(sitk_image, sitk.Image)
-    assert np.all(image == result)
+    assert np.all(dummy_vector_field == result)
 
 
-def test_invert_matrix_axes():
+def test_invert_matrix_axes(dummy_affine_matrix):
     """
     """
 
-    matrix = np.arange(16).reshape((4,4))
-    matrix[3] = [0, 0, 0, 1]
     correct = np.array( [[10, 9, 8, 11],
                          [6, 5, 4, 7],
                          [2, 1, 0, 3],
                          [0, 0, 0, 1]] )
-    result = ut.invert_matrix_axes(matrix)
+    result = ut.invert_matrix_axes(dummy_affine_matrix)
     assert np.all(result == correct)
 
 
-def test_change_affine_matrix_origin():
+def test_change_affine_matrix_origin(dummy_affine_matrix):
     """
     """
 
-    matrix = np.arange(16).reshape((4,4))
-    matrix[3] = [0, 0, 0, 1]
     correct = np.array( [[0, 1, 2, 4],
                          [4, 5, 6, -7],
                          [8, 9, 10, -23],
                          [0, 0, 0, 1]] )
-    result = ut.change_affine_matrix_origin(matrix, (2, 3, -1))
+    result = ut.change_affine_matrix_origin(dummy_affine_matrix, (2, 3, -1))
     assert np.all(result == correct)
 
 
-def test_integration_matrix_to_affine_and_inverse():
+def test_integration_matrix_to_affine_and_inverse(dummy_affine_matrix):
     """
     """
 
-    matrix = np.arange(16).reshape((4,4))
-    matrix[3] = [0, 0, 0, 1]
-    transform = ut.matrix_to_affine_transform(matrix)
+    transform = ut.matrix_to_affine_transform(dummy_affine_matrix)
     affine = ut.affine_transform_to_matrix(transform)
     assert isinstance(transform, sitk.AffineTransform)
-    assert np.all(matrix == affine)
+    assert np.all(dummy_affine_matrix == affine)
 
 
 def test_integration_matrix_to_euler_and_inverse():
@@ -81,72 +117,76 @@ def test_integration_matrix_to_euler_and_inverse():
     assert np.allclose(matrix, matrix2)
 
 
-def test_matrix_to_displacement_field():
+def test_physical_parameters_to_affine_matrix():
     """
     """
 
-    scale, trans = (2, 3, 4), (2, 4, 6)
+    params = np.array( [ 10, 20, 30,
+                         np.pi/6, np.pi/4, np.pi/2,
+                         1.05, 0.95, 0.8,
+                         0.2, 0.3, 0.4, ] )
+    array = ut.physical_parameters_to_affine_matrix(params, (0, 0, 0))
+    correct = np.array([[ 0.0535884 , -0.71271186,  1.03889313, 17.44844071],
+                        [ 0.94484514, -0.17477094,  0.70403709, 27.07414529],
+                        [ 0.20343283,  0.21233866,  0.99801973, 36.22169328],
+                        [ 0.        ,  0.        ,  0.        ,  1.        ]])
+    assert np.allclose(array, correct)
+
+
+def test_matrix_to_displacement_field(dummy_scale_translate_matrix):
+    """
+    """
+
+    scale = np.diag(dummy_scale_translate_matrix)[:-1]
+    trans = dummy_scale_translate_matrix[:3, -1]
     shape, spacing = (10, 10, 10,), (0.5, 0.25, 2.0)
-    matrix = np.diag(scale + (1,))
-    matrix[:3, -1] = trans
     correct = np.array(np.mgrid[:10, :10, :10]).transpose(1,2,3,0) * spacing
     correct = correct * scale + trans - correct
-    field = ut.matrix_to_displacement_field(matrix, shape, spacing)
+    field = ut.matrix_to_displacement_field(dummy_scale_translate_matrix, shape, spacing)
     assert np.all(field == correct)
 
 
-def test_field_to_displacement_field_transform():
+def test_field_to_displacement_field_transform(dummy_scale_translate_matrix):
     """
     """
 
-    scale, trans = (2, 3, 4), (2, 4, 6)
+    scale = np.diag(dummy_scale_translate_matrix)[:-1]
+    trans = dummy_scale_translate_matrix[:3, -1]
     shape, spacing = (10, 10, 10,), (0.5, 0.25, 2.0)
-    matrix = np.diag(scale + (1,))
-    matrix[:3, -1] = trans
     correct = np.array(np.mgrid[:10, :10, :10]).transpose(1,2,3,0) * spacing
     correct = correct * scale + trans - correct
-    field = ut.matrix_to_displacement_field(matrix, shape, spacing)
+    field = ut.matrix_to_displacement_field(dummy_scale_translate_matrix, shape, spacing)
     transform = ut.field_to_displacement_field_transform(field, spacing)
     field2 = sitk.GetArrayFromImage(transform.GetDisplacementField())[..., ::-1]
     assert np.all(field2 == correct)
 
 
-def test_integration_bspline_parameters_to_transform_to_field():
+def test_integration_bspline_parameters_to_transform_to_field(
+    dummy_bspline_params,
+):
     """
     """
 
-    a = (4,)*3    # mesh_size
-    b = (-1,)*3   # mesh_origin
-    c = (1,)*3    # mesh_spacing
-    d = np.eye(3).ravel()    # mesh_directions
-    e = np.ones(np.prod(a) * 3) * 6    #coefficients
-    params = np.concatenate((a, b, c, d, e))
-    transform = ut.bspline_parameters_to_transform(params)
+    transform = ut.bspline_parameters_to_transform(dummy_bspline_params)
     field = ut.bspline_to_displacement_field(transform, (10,)*3, spacing=(0.1,)*3)
     correct = np.ones((10,)*3 + (3,)) * 6
     assert isinstance(transform, sitk.BSplineTransform)
     assert np.all(field == correct)
 
 
-def test_transform_list_to_composite_transform():
+def test_transform_list_to_composite_transform(
+    dummy_affine_matrix,
+    dummy_scale_translate_matrix,
+    dummy_bspline_params,
+    dummy_vector_field,
+):
     """
     """
 
-    # affine transforms
-    aff1 = np.arange(16).reshape((4,4))
-    aff1[3] = [0, 0, 0, 1]
-    aff2 = np.eye(4) * 6
-    aff2[3, 3] = 1
-    # bspline transform
-    a = (4,)*3    # mesh_size
-    b = (-1,)*3   # mesh_origin
-    c = (1,)*3    # mesh_spacing
-    d = np.eye(3).ravel()    # mesh_directions
-    e = np.ones(np.prod(a) * 3) * 6    #coefficients
-    bsp = np.concatenate((a, b, c, d, e))
-    # displacement vector field
-    dvf = np.ones((10,)*3 + (3,)) * 12
-
+    aff1 = dummy_affine_matrix
+    aff2 = dummy_scale_translate_matrix
+    bsp = dummy_bspline_params
+    dvf = dummy_vector_field
     transform_list = [aff1, aff2, bsp, dvf]
     spacing = (None, None, None, (0.1, 0.1, 0.1))
     composite = ut.transform_list_to_composite_transform(
