@@ -27,7 +27,6 @@ setuptools.setup(
         'morphsnakes',
         'ClusterWrap>=0.2.0',
         'pynrrd',
-        'greedypy',
-        'dask-stitch>=0.2.1',
+        'pytest',
     ]
 )
