@@ -5,7 +5,6 @@ import CircuitSeeker.utility as ut
 from CircuitSeeker.configure_irm import configure_irm
 from CircuitSeeker.transform import apply_transform
 from CircuitSeeker.metrics import patch_mutual_information
-from scipy.spatial.transform import Rotation
 
 
 def skip_sample_images(
@@ -201,31 +200,8 @@ def random_affine_search(
     if max_rotation: params[1:, 3:6] = F(max_rotation)
     if max_scale: params[1:, 6:9] = np.e**F(np.log(max_scale))
     if max_shear: params[1:, 9:] = F(max_shear)
+    center = np.array(fix.shape) / 2 * fix_spacing  # center of rotation
 
-    # define conversion from params to affine transform matrix
-    def params_to_affine_matrix(params):
-        # translation
-        aff = np.eye(4)
-        aff[:3, -1] = params[:3]
-        # rotation
-        x = np.eye(4)
-        x[:3, :3] = Rotation.from_rotvec(params[3:6]).as_matrix()
-        center = np.array(fix.shape) / 2 * fix_spacing
-        tl, tr = np.eye(4), np.eye(4)
-        tl[:3, -1], tr[:3, -1] = center, -center
-        x = np.matmul(tl, np.matmul(x, tr))
-        aff = np.matmul(x, aff)
-        # scale
-        x = np.diag(tuple(params[6:9]) + (1,))
-        aff = np.matmul(x, aff)
-        # shear
-        shx, shy, shz = np.eye(4), np.eye(4), np.eye(4)
-        shx[1, 0], shx[2, 0] = params[10], params[11]
-        shy[0, 1], shy[2, 1] = params[9], params[11]
-        shz[0, 2], shz[1, 2] = params[9], params[10]
-        x = np.matmul(shz, np.matmul(shy, shx))
-        return np.matmul(x, aff)
- 
     # skip sample to alignment spacing
     if alignment_spacing:
         fix, mov, fix_mask, mov_mask, fix_spacing, mov_spacing = skip_sample_image(
@@ -240,7 +216,7 @@ def random_affine_search(
         # wrap patch_mi metric
         def score_affine(affine):
             # apply transform
-            transform_list = static_moving_transforms_list + [affine,]
+            transform_list = static_moving_transform_list + [affine,]
             aligned = apply_transform(
                 fix, mov, fix_spacing, mov_spacing,
                 transform_list=transform_list,
@@ -272,6 +248,7 @@ def random_affine_search(
     # use an irm metric
     else:
         # construct irm, set images, masks, transforms
+        kwargs['optimizer'] = 'LBFGS2'    # optimizer is not used, just a dummy value
         irm = configure_irm(**kwargs)
         fix, mov, fix_mask, mov_mask = images_to_sitk(
             fix, mov, fix_mask, mov_mask,
@@ -279,9 +256,9 @@ def random_affine_search(
         )
         if fix_mask is not None: irm.SetMetricFixedMask(fix_mask)
         if mov_mask is not None: irm.SetMetricMovingMask(mov_mask)
-        if static_moving_transforms_list:
-            T = transform_list_to_composite_transform(
-                static_moving_transforms_list,
+        if static_moving_transform_list:
+            T = ut.transform_list_to_composite_transform(
+                static_moving_transform_list,
                 static_moving_transform_spacing,
                 static_moving_transform_origin,
             )
@@ -299,7 +276,7 @@ def random_affine_search(
     current_best_score = WORST_POSSIBLE_SCORE
     scores = np.empty(random_iterations + 1, dtype=np.float64)
     for iii, ppp in enumerate(params):
-        scores[iii] = score_affine(params_to_affine_matrix(ppp))
+        scores[iii] = score_affine(ut.physical_parameters_to_affine_matrix(ppp, center))
         if print_running_improvements and scores[iii] < current_best_score:
                 current_best_score = scores[iii]
                 print(iii, ': ', current_best_score, '\n', ppp)
@@ -308,7 +285,7 @@ def random_affine_search(
     # return top results
     partition_indx = np.argpartition(scores, nreturn)[:nreturn]
     params, scores = params[partition_indx], scores[partition_indx]
-    return [params_to_affine_matrix(p) for p in params[np.argsort(scores)]]
+    return [ut.physical_parameters_to_affine_matrix(p, center) for p in params[np.argsort(scores)]]
 
 
 def affine_align(
@@ -423,9 +400,9 @@ def affine_align(
     # set up registration object
     irm = configure_irm(**kwargs)
     # set initial static transforms
-    if static_moving_transforms_list:
-        T = transform_list_to_composite_transform(
-            static_moving_transforms_list,
+    if static_moving_transform_list:
+        T = ut.transform_list_to_composite_transform(
+            static_moving_transform_list,
             static_moving_transform_spacing,
             static_moving_transform_origin,
         )
@@ -436,7 +413,7 @@ def affine_align(
     elif rigid and initial_transform_given:
         transform = ut.matrix_to_euler_transform(initial_condition)
     elif not rigid and not initial_transform_given:
-        transform = sitk.AffineTransform(fix.ndim)
+        transform = sitk.AffineTransform(fix.GetDimension())
     elif not rigid and initial_transform_given:
         transform = ut.matrix_to_affine_transform(initial_condition)
     if isinstance(initial_condition, str) and initial_condition == "CENTER":
@@ -601,9 +578,9 @@ def deformable_align(
         transform, inPlace=True, scaleFactors=control_point_levels,
     )
     # set initial static transforms
-    if static_moving_transforms_list:
-        T = transform_list_to_composite_transform(
-            static_moving_transforms_list,
+    if static_moving_transform_list:
+        T = ut.transform_list_to_composite_transform(
+            static_moving_transform_list,
             static_moving_transform_spacing,
             static_moving_transform_origin,
         )
@@ -616,7 +593,9 @@ def deformable_align(
     if not default:
         params = np.concatenate((transform.GetFixedParameters(), transform.GetParameters()))
         field = ut.bspline_to_displacement_field(
-            fix, transform, shape=initial_fix_shape,
+            transform, initial_fix_shape,
+            spacing=fix_spacing, origin=fix_origin,
+            direction=np.eye(3),
         )
         default = (params, field)
 
@@ -635,7 +614,9 @@ def deformable_align(
     if final_metric_value < initial_metric_value:
         params = np.concatenate((transform.GetFixedParameters(), transform.GetParameters()))
         field = ut.bspline_to_displacement_field(
-            fix, transform, shape=initial_fix_shape,
+            transform, initial_fix_shape,
+            spacing=fix_spacing, origin=fix_origin,
+            direction=np.eye(3),
         )
         sys.stdout.flush()
         return params, field
@@ -772,7 +753,7 @@ def alignment_pipeline(
             static_moving_transform_spacing=static_moving_transform_spacing,
             static_moving_transform_origin=static_moving_transform_origin,
             **random_kwargs,
-         )
+         )[0]
     # rigid alignment
     if 'rigid' in steps:
         if 'random' in steps:
@@ -821,7 +802,7 @@ def alignment_pipeline(
             static_moving_transform_spacing=static_moving_transform_spacing,
             static_moving_transform_origin=static_moving_transform_origin,
             **deform_kwargs,
-        )
+        )[1]
         return affine, deform
 
     # return affine result

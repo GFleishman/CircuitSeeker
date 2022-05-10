@@ -4,7 +4,7 @@ import SimpleITK as sitk
 
 def configure_irm(
     metric='MMI',
-    optimizer='RSGD'
+    optimizer='RSGD',
     sampling='NONE',
     interpolator='1',
     shrink_factors=(1,),
@@ -65,11 +65,7 @@ def configure_irm(
         Options:
             '0':    NearestNeighbor,
             '1':    Linear,
-            'BS1':  BSpline1,
-            'BS2':  BSpline2,
-            'BS3':  BSpline3,
-            'BS4':  BSpline4,
-            'BS5':  BSpline5,
+            'CBS':   CubicBSpline,
             'G':    Gaussian,
             'LG':   LabelGaussian,
             'HWS':  HammingWindowedSinc,
@@ -134,11 +130,7 @@ def configure_irm(
     interpolator_switch = {
         '0':sitk.sitkNearestNeighbor,
         '1':sitk.sitkLinear,
-        'BS1':sitk.sitkBSpline1,
-        'BS2':sitk.sitkBSpline2,
-        'BS3':sitk.sitkBSpline3,
-        'BS4':sitk.sitkBSpline4,
-        'BS5':sitk.sitkBSpline5,
+        'CBS':sitk.sitkBSpline,
         'G':sitk.sitkGaussian,
         'LG':sitk.sitkLabelGaussian,
         'HWS':sitk.sitkHammingWindowedSinc,

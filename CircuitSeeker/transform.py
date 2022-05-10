@@ -35,6 +35,7 @@ def apply_transform(
     mov = sitk.Cast(ut.numpy_to_sitk(mov, mov_spacing, mov_origin), sitk.sitkFloat32)
 
     # construct transform
+    fix_spacing = np.array(fix_spacing)
     transform = ut.transform_list_to_composite_transform(
         transform_list, transform_spacing or fix_spacing, transform_origin,
     )
