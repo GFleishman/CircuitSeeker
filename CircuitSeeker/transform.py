@@ -271,13 +271,13 @@ def compose_transforms(transform_one, transform_two, spacing):
     # one affine, two field
     elif transform_one.shape == (4, 4):
         transform_one = ut.matrix_to_displacement_field(
-            transform_two[..., 0], transform_one, spacing,
+            transform_one, transform_two.shape[:-1], spacing,
         )
 
     # one field, two affine
     elif transform_two.shape == (4, 4):
         transform_two = ut.matrix_to_displacement_field(
-            transform_one[..., 0], transform_two, spacing,
+            transform_two, transform_one.shape[:-1], spacing,
         )
 
     # compose fields
