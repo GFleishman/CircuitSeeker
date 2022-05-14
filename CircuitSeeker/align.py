@@ -204,7 +204,7 @@ def random_affine_search(
 
     # skip sample to alignment spacing
     if alignment_spacing:
-        fix, mov, fix_mask, mov_mask, fix_spacing, mov_spacing = skip_sample_image(
+        fix, mov, fix_mask, mov_mask, fix_spacing, mov_spacing = skip_sample_images(
             fix, mov, fix_mask, mov_mask, fix_spacing, mov_spacing, alignment_spacing,
         )
 
@@ -249,6 +249,7 @@ def random_affine_search(
     else:
         # construct irm, set images, masks, transforms
         kwargs['optimizer'] = 'LBFGS2'    # optimizer is not used, just a dummy value
+        kwargs['optimizer_args'] = {}
         irm = configure_irm(**kwargs)
         fix, mov, fix_mask, mov_mask = images_to_sitk(
             fix, mov, fix_mask, mov_mask,
@@ -390,7 +391,7 @@ def affine_align(
 
     # skip sample and convert inputs to sitk images
     if alignment_spacing:
-        fix, mov, fix_mask, mov_mask, fix_spacing, mov_spacing = skip_sample_image(
+        fix, mov, fix_mask, mov_mask, fix_spacing, mov_spacing = skip_sample_images(
             fix, mov, fix_mask, mov_mask, fix_spacing, mov_spacing, alignment_spacing,
         )
     fix, mov, fix_mask, mov_mask = images_to_sitk(
@@ -408,6 +409,12 @@ def affine_align(
         )
         irm.SetMovingInitialTransform(T)
     # set transform to optimize
+    if isinstance(initial_condition, str) and initial_condition == "CENTER":
+        x = sitk.CenteredTransformInitializer(fix, mov, sitk.Euler3DTransform())
+        x = sitk.Euler3DTransform(x).GetTranslation()[::-1]
+        initial_condition = np.eye(4)
+        initial_condition[:3, -1] = x
+        initial_transform_given = True
     if rigid and not initial_transform_given:
         transform = sitk.Euler3DTransform()
     elif rigid and initial_transform_given:
@@ -416,8 +423,6 @@ def affine_align(
         transform = sitk.AffineTransform(fix.GetDimension())
     elif not rigid and initial_transform_given:
         transform = ut.matrix_to_affine_transform(initial_condition)
-    if isinstance(initial_condition, str) and initial_condition == "CENTER":
-        transform = sitk.CenteredTransformInitializer(fix, mov, transform)
     irm.SetInitialTransform(transform, inPlace=True)
     # set masks
     if fix_mask is not None: irm.SetMetricFixedMask(fix_mask)
@@ -432,11 +437,6 @@ def affine_align(
         print("Registration failed due to ITK exception:\n", e)
         print("Returning default", flush=True)
         return default
-
-    # if centered, convert back to appropriate transform object
-    if isinstance(initial_condition, str) and initial_condition == "CENTER":
-        if rigid: transform = sitk.Euler3DTransform(transform)
-        else: transform = sitk.AffineTransform(transform)
 
     # if registration improved metric return result
     # otherwise return default
@@ -559,7 +559,7 @@ def deformable_align(
 
     # skip sample and convert inputs to sitk images
     if alignment_spacing:
-        fix, mov, fix_mask, mov_mask, fix_spacing, mov_spacing = skip_sample_image(
+        fix, mov, fix_mask, mov_mask, fix_spacing, mov_spacing = skip_sample_images(
             fix, mov, fix_mask, mov_mask, fix_spacing, mov_spacing, alignment_spacing,
         )
     fix, mov, fix_mask, mov_mask = images_to_sitk(

@@ -1,13 +1,12 @@
-import time, os, shutil
+import os, shutil
 import numpy as np
-import dask.array as da
-from dask.distributed import as_completed
+from itertools import product
+from dask.distributed import as_completed, wait
 from ClusterWrap.decorator import cluster
 import CircuitSeeker.utility as ut
+from CircuitSeeker.align import alignment_pipeline
 from CircuitSeeker.transform import apply_transform
 from CircuitSeeker.transform import compose_transforms
-import zarr
-from itertools import product
 
 
 @cluster
@@ -16,11 +15,14 @@ def distributed_piecewise_alignment_pipeline(
     mov,
     fix_spacing,
     mov_spacing,
+    steps,
     nblocks,
     overlap=0.5,
     fix_mask=None,
     mov_mask=None,
-    steps=['rigid', 'affine'],
+    static_moving_transform_list=[],
+    static_moving_transform_spacing=None,
+    static_moving_transform_origin=None,
     random_kwargs={},
     rigid_kwargs={},
     affine_kwargs={},
@@ -32,10 +34,13 @@ def distributed_piecewise_alignment_pipeline(
     **kwargs,
 ):
     """
-    Piecewise affine alignment of moving to fixed image.
-    Overlapping blocks are given to `affine_align` in parallel
-    on distributed hardware. Can include random initialization,
-    rigid alignment, and affine alignment.
+    Piecewise alignment of moving to fixed image.
+    Overlapping blocks are given to `alignment_pipeline` in parallel
+    on distributed hardware. Can include random, rigid, affine, and
+    deformable alignment. Inputs can be numpy or zarr arrays. Output
+    is a single displacement vector field for the entire domain.
+    Output can be returned to main process memory as a numpy array
+    or written to disk as a zarr array.
 
     Parameters
     ----------
@@ -58,6 +63,9 @@ def distributed_piecewise_alignment_pipeline(
         of the moving image.
         Length must equal `mov.ndim`
 
+    steps : list of strings
+        steps argument of alignment_pipeline function
+
     nblocks : iterable
         The number of blocks to use along each axis.
         Length should be equal to `fix.ndim`
@@ -74,41 +82,37 @@ def distributed_piecewise_alignment_pipeline(
         you must also provide a fix_mask. A reasonable choice if
         no fix_mask exists is an array of all ones.
 
-    steps : list of type string (default: ['rigid', 'affine'])
-        Flags to indicate which steps to run. An empty list will guarantee
-        all affines are the identity. Any of the following may be in the list:
-            'random': run `random_affine_search` first
-            'rigid': run `affine_align` with rigid=True
-            'affine': run `affine_align` with rigid=False
-        If all steps are present they are run in the order given above.
-        Steps share parameters given to kwargs. Parameters for individual
-        steps override general settings with `random_kwargs`, `rigid_kwargs`,
-        and `affine_kwargs`. If `random` is in the list, `random_kwargs`
-        must be defined.
+    static_moving_transform_list : list of numpy arrays (default: [])
+        Transforms applied to moving image before applying query transform
+
+    static_moving_transform_spacing : np.ndarray or tuple of np.ndarray (default: None)
+        Spacing of transforms in static_moving_transform_list
+        Only necessary for displacement field transforms.
+
+    static_moving_transform_origin : np.ndarray or tuple of np.ndarray (default: None)
+        Origin of transforms in static_moving_transform_list
+        Only necessary for displacement field transforms.
 
     random_kwargs : dict (default: {})
-        Keyword arguments to pass to `random_affine_search`. This is only
-        necessary if 'random' is in `steps`. If so, the following keys must
-        be given:
-                'max_translation'
-                'max_rotation'
-                'max_scale'
-                'max_shear'
-                'random_iterations'
-        However any argument to `random_affine_search` may be defined. See
-        documentation for `random_affine_search` for descriptions of these
-        parameters. If 'random' and 'rigid' are both in `steps` then
-        'max_scale' and 'max_shear' must both be 0.
+        Arguments passed to `random_affine_search`
+        Note - some arguments are required. See documentation for `random_affine_search`
 
     rigid_kwargs : dict (default: {})
-        If 'rigid' is in `steps`, these keyword arguments are passed
-        to `affine_align` during the rigid=True step. They override
-        any common general kwargs.
+        Arguments passed to `affine_align` during rigid step
+        Note - some arguments are required. See documentation for `affine_align`
 
     affine_kwargs : dict (default: {})
-        If 'affine' is in `steps`, these keyword arguments are passed
-        to `affine_align` during the rigid=False (affine) step. They
-        override any common general kwargs.
+        Arguments passed to `affine_align` during affine step
+        Note - some arguments are required. See documentation for `affine_align`
+
+    deform_kwargs : dict (default: {})
+        Arguments passed to `deformable_align`
+        Note - some arguments are required. See documentation for `deformable_align`
+
+    cluster : ClusterWrap.cluster object (default: None)
+        Only set if you have constructed your own static cluster. The default behavior
+        is to construct a cluster for the duration of this function, then close it
+        when the function is finished.
 
     cluster_kwargs : dict (default: {})
         Arguments passed to ClusterWrap.cluster
@@ -117,50 +121,58 @@ def distributed_piecewise_alignment_pipeline(
         this will be ClusterWrap.local_cluster.
         This is how distribution parameters are specified.
 
+    temporary_directory : string (default: None)
+        Temporary files are created during alignment. The temporary files will be
+        in their own folder within the `temporary_directory`. The default is the
+        current directory. Temporary files are removed if the function completes
+        successfully.
+
+    write_path : string (default: None)
+        If the transform found by this function is too large to fit into main
+        process memory, set this parameter to a location where the transform
+        can be written to disk as a zarr file.
+
     kwargs : any additional arguments
-        Passed to calls `random_affine_search` and `affine_align` calls
+        Arguments that will apply to all alignment steps. These are overruled by
+        arguments for specific steps e.g. `random_kwargs` etc.
 
     Returns
     -------
-    affines : nd array
-        Affine matrix for each block. Shape is (X, Y, ..., 4, 4)
-        for X blocks along first axis and so on.
-
-    field : nd array
+    field : nd array or zarr.core.Array
         Local affines stitched together into a displacement field
         Shape is `fix.shape` + (3,) as the last dimension contains
         the displacement vector.
     """
 
-    # compute block size and overlaps
-    blocksize = np.array(fix.shape).astype(np.float32) / nblocks
-    blocksize = np.ceil(blocksize).astype(np.int16)
-    overlaps = np.round(blocksize * overlap).astype(np.int16)
-
-    # ensure temporary directory exists
+    # temporary file paths and create zarr images
     if temporary_directory is None:
         temporary_directory = os.getcwd()
     temporary_directory += '/distributed_alignment_temp'
     os.makedirs(temporary_directory)
-
-    # define zarr paths
     fix_zarr_path = temporary_directory + '/fix.zarr'
     mov_zarr_path = temporary_directory + '/mov.zarr'
     fix_mask_zarr_path = temporary_directory + '/fix_mask.zarr'
     mov_mask_zarr_path = temporary_directory + '/mov_mask.zarr'
-
-    # create zarr files
     zarr_blocks = (128,)*fix.ndim
     fix_zarr = ut.numpy_to_zarr(fix, zarr_blocks, fix_zarr_path)
     mov_zarr = ut.numpy_to_zarr(mov, zarr_blocks, mov_zarr_path)
-    if fix_mask is not None:
-        fix_mask_zarr = ut.numpy_to_zarr(fix_mask, zarr_blocks, fix_mask_zarr_path)
-    if mov_mask is not None:
-        mov_mask_zarr = ut.numpy_to_zarr(mov_mask, zarr_blocks, mov_mask_zarr_path)
+    if fix_mask is not None: fix_mask_zarr = ut.numpy_to_zarr(fix_mask, zarr_blocks, fix_mask_zarr_path)
+    if mov_mask is not None: mov_mask_zarr = ut.numpy_to_zarr(mov_mask, zarr_blocks, mov_mask_zarr_path)
+
+    # zarr files for initial deformations
+    new_list = []
+    for iii, transform in enumerate(static_moving_transform_list):
+        if transform.shape != (4, 4):
+            path = temporary_directory + f'/deform{iii}.zarr'
+            transform = ut.numpy_to_zarr(transform, zarr_blocks + (transform.shape[-1],), path)
+        new_list.append(transform)
+    static_moving_transform_list = new_list
 
     # determine indices for blocking
+    blocksize = np.ceil( np.array(fix.shape) / nblocks ).astype(int)
+    overlaps = np.round(blocksize * overlap).astype(int)
     indices = []
-    for (i, j, k) in product(*[range(x) for x in nblocks]):
+    for (i, j, k) in np.ndindex(*nblocks):
         start = blocksize * (i, j, k) - overlaps
         stop = start + blocksize + 2 * overlaps
         start = np.maximum(0, start)
@@ -175,25 +187,60 @@ def distributed_piecewise_alignment_pipeline(
     deform_kwargs = {**kwargs, **deform_kwargs}
 
     # closure for alignment pipeline
-    def align_single_block(indices):
+    def align_single_block(
+        indices,
+        static_moving_transform_list,
+        static_moving_transform_spacing,
+    ):
 
-        # squeeze the coords and convert to tuple of slices
-        block_index = indices[:3]
-        coords = indices[3]
-
-        # read the chunks
+        # get the coordinates, read fixed data
+        block_index, coords = indices[:3], indices[3]
+        fix_start = [s.start for s in coords]
+        fix_stop = [s.stop for s in coords]
+        fix_start_xyz = fix_spacing * fix_start
+        fix_stop_xyz = fix_spacing * fix_stop
         fix = fix_zarr[coords]
-        mov = mov_zarr[coords]
+
+        # parse initial transforms
+        # recenter affines, zoom deforms, get moving coords, read moving data
+        new_list = []
+        mov_start_xyz = np.copy(fix_start_xyz)
+        mov_stop_xyz = np.copy(fix_stop_xyz)
+        for transform in static_moving_transform_list[::-1]:
+            if transform.shape == (4, 4):
+                mov_start_xyz = np.matmul(transform, tuple(mov_start_xyz) + (1,))[:-1]
+                mov_stop_xyz = np.matmul(transform, tuple(mov_stop_xyz) + (1,))[:-1]
+                transform = ut.change_affine_matrix_origin(transform, -fix_start_xyz)
+            else:
+                ratio = np.array(transform.shape[:-1]) / fix_zarr.shape
+                trans_start = np.round( ratio * fix_start ).astype(int)
+                trans_stop = np.round( ratio * fix_stop ).astype(int)
+                transform_coords = tuple(slice(a, b) for a, b in zip(trans_start, trans_stop))
+                transform = transform[transform_coords]
+                mov_start_xyz += transform[(0,) * len(coords)]
+                mov_stop_xyz += transform[(-1,) * len(coords)]
+            new_list.append(transform)
+        static_moving_transform_list = new_list[::-1]
+        mov_start = np.floor( mov_start_xyz / mov_spacing ).astype(int)
+        mov_start = np.maximum(0, mov_start)
+        mov_stop = np.ceil( mov_stop_xyz / mov_spacing ).astype(int)
+        mov_stop = np.minimum(mov_zarr.shape, mov_stop)
+        mov_coords = tuple(slice(a, b) for a, b in zip(mov_start, mov_stop))
+        mov = mov_zarr[mov_coords]
+
+        # TODO: these may not be the right shape
+        # read masks
         fix_mask, mov_mask = None, None
-        if os.path.isdir(fix_mask_zarr_path):
-            fix_mask = fix_mask_zarr[coords]
-        if os.path.isdir(mov_mask_zarr_path):
-            mov_mask = mov_mask_zarr[coords]
+        if os.path.isdir(fix_mask_zarr_path): fix_mask = fix_mask_zarr[coords]
+        if os.path.isdir(mov_mask_zarr_path): mov_mask = mov_mask_zarr[mov_coords]
 
         # run alignment pipeline
         transform = alignment_pipeline(
             fix, mov, fix_spacing, mov_spacing, steps,
             fix_mask=fix_mask, mov_mask=mov_mask,
+            mov_origin=mov_start_xyz - fix_start_xyz,
+            static_moving_transform_list=static_moving_transform_list,
+            static_moving_transform_spacing=static_moving_transform_spacing,
             random_kwargs=random_kwargs,
             rigid_kwargs=rigid_kwargs,
             affine_kwargs=affine_kwargs,
@@ -202,17 +249,14 @@ def distributed_piecewise_alignment_pipeline(
 
         # convert to single vector field
         if isinstance(transform, tuple):
-            affine, deform = transform[0], transform[1][1]
+            affine, deform = transform[0], transform[1]
             transform = compose_transforms(affine, deform, fix_spacing)
         else:
-            transform = ut.matrix_to_displacement_field(
-                fix, transform, fix_spacing,
-            )
+            transform = ut.matrix_to_displacement_field(transform, fix.shape, fix_spacing)
 
         # create weights array
         core, pad_ones, pad_linear = [], [], []
         for i in range(3):
-
             # get core shape and pad sizes
             o = max(0, 2*overlaps[i]-1)
             p_ones, p_linear = [0, 0], [o, o]
@@ -223,13 +267,12 @@ def distributed_piecewise_alignment_pipeline(
             core.append( blocksize[i] - o + 1 )
             pad_ones.append(tuple(p_ones))
             pad_linear.append(tuple(p_linear))
-
         # create weights
         weights = np.ones(core, dtype=np.float32)
         weights = np.pad(weights, pad_ones, mode='constant', constant_values=1)
         weights = np.pad(weights, pad_linear, mode='linear_ramp', end_values=0)
 
-        # crop for incomplete blocks (on the ends)
+        # crop any incomplete blocks (on the ends)
         if np.any( weights.shape != transform.shape[:-1] ):
             crop = tuple(slice(0, s) for s in transform.shape[:-1])
             weights = weights[crop]
@@ -238,17 +281,16 @@ def distributed_piecewise_alignment_pipeline(
         return transform * weights[..., None]
     # END CLOSURE
 
-    # wait for at least one worker to be fully instantiated
-    while ((cluster.client.status == "running") and
-           (len(cluster.client.scheduler_info()["workers"]) < 1)):
-        time.sleep(1.0)
-
     # submit all alignments to cluster
-    futures = cluster.client.map(align_single_block, indices)
+    futures = cluster.client.map(
+        align_single_block, indices,
+        static_moving_transform_list=static_moving_transform_list,
+        static_moving_transform_spacing=static_moving_transform_spacing,
+    )
     future_keys = [f.key for f in futures]
 
     # for small alignments
-    if write_path is None:
+    if not write_path:
         # initialize container, monitor progress, write blocks when finished
         transform = np.zeros(fix.shape + (fix.ndim,), dtype=np.float32)
         for batch in as_completed(futures, with_results=True).batches():
@@ -257,24 +299,43 @@ def distributed_piecewise_alignment_pipeline(
                 transform[indices[iii][3]] += result
 
     # for large alignments
-    # TODO: time is probably going to be an issue here
-    #       need to write some of the data in parallel directly from workers
     else:
-        # initialize container
+
+        # initialize container and define how to write to it
         shape = fix.shape + (fix.ndim,)
-        zarr_blocks = (128,)*fix.ndim + (fix.ndim,)
-        transform = ut.create_zarr(write_path, shape, zarr_blocks, np.float32)
-        for future, result in as_completed(futures, with_results=True):
-            iii = future_keys.index(future.key)
-            transform[indices[iii][3]] = transform[indices[iii][3]] + result
+        transform = ut.create_zarr(write_path, shape, zarr_blocks + (fix.ndim,), np.float32)
+        def write_block(coords, block):
+            transform[coords] = transform[coords] + block
 
-    # remove temporary files
+        # function for getting neighbor indices
+        neighbor_offsets = np.array(list(product(range(-1, 2), repeat=3)))
+        def neighbor_indices(index):
+            lock_indices = (index + neighbor_offsets).transpose()
+            not_too_low = lock_indices.min(axis=0) >= 0
+            not_too_high = np.all(lock_indices < np.array(nblocks)[:, None], axis=0)
+            lock_indices = lock_indices[:, not_too_low * not_too_high]
+            return np.ravel_multi_index(lock_indices, nblocks)
+
+        # write blocks as parallel as possible
+        written = np.zeros(len(futures), dtype=bool)
+        while not np.all(written):
+            writing_futures = []
+            locked = np.zeros(len(futures), dtype=bool)
+            for future in futures:
+                iii = future_keys.index(future.key)
+                if future.done() and not written[iii] and not locked[iii]:
+                    f = cluster.client.submit(write_block, indices[iii][3], future)
+                    locked[neighbor_indices(indices[iii][:3])] = True
+                    writing_futures.append(f)
+                    written[iii] = True
+            wait(writing_futures)
+            
+    # remove temporary files and return
     shutil.rmtree(temporary_directory)
-
-    # return transform
     return transform
 
 
+# TODO: this function not yet refactored
 @cluster
 def nested_distributed_piecewise_alignment_pipeline(
     fix,
