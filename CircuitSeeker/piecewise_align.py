@@ -233,6 +233,8 @@ def distributed_piecewise_alignment_pipeline(
 
         # get moving image crop, read moving data 
         mov_block_coords = np.round(mov_block_coords_phys / mov_spacing).astype(int)
+        mov_block_coords = np.maximum(0, mov_block_coords)
+        mov_block_coords = np.minimum(np.array(mov_zarr.shape)-1, mov_block_coords)
         mov_start = np.min(mov_block_coords, axis=0)
         mov_stop = np.max(mov_block_coords, axis=0)
         mov_slices = tuple(slice(a, b) for a, b in zip(mov_start, mov_stop))
