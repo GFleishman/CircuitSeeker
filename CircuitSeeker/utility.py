@@ -181,6 +181,19 @@ def bspline_to_displacement_field(
     return sitk.GetArrayFromImage(df).astype(np.float32)[..., ::-1]
 
 
+# TODO: function that takes a numpy array and return transform type
+
+
+def relative_spacing(query, reference, reference_spacing):
+    """
+    """
+
+    ndim = len(reference_spacing)
+    ratio = np.array(reference.shape[:ndim]) / query.shape[:ndim]
+    return reference_spacing * ratio
+
+
+
 def transform_list_to_composite_transform(transform_list, spacing=None, origin=None):
     """
     """
