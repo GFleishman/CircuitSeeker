@@ -174,6 +174,17 @@ def test_integration_bspline_parameters_to_transform_to_field(
     assert np.all(field == correct)
 
 
+def test_relative_spacing():
+    """
+    """
+
+    a = np.empty((4, 10, 1))
+    b = np.empty((10, 5, 3))
+    c = np.array((1, 1, 1))
+    d = ut.relative_spacing(a, b, c)
+    assert np.all(d == (2.5, 0.5, 3))
+
+
 def test_transform_list_to_composite_transform(
     dummy_affine_matrix,
     dummy_scale_translate_matrix,

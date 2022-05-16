@@ -44,23 +44,26 @@ def dummy_mov_image(
     )
 
 
-def test_skip_sample_images(
+def test_resolve_sampling(
     dummy_fix_image, dummy_mov_image,
 ):
     """
     """
 
-    a, b, c, d, e, f = align.skip_sample_images(
+    X = align.resolve_sampling(
         dummy_fix_image, dummy_mov_image,
-        dummy_fix_image, dummy_mov_image,
+        dummy_fix_image[::2, ::2, ::2],
+        dummy_mov_image[::2, ::2, ::2],
         (1.,)*3, (1.,)*3, (2, 3, 4),
     )
-    assert a.shape == (20, 14, 10)
-    assert b.shape == (20, 14, 10)
-    assert c.shape == (20, 14, 10)
-    assert d.shape == (20, 14, 10)
-    assert np.all(e == np.array([2, 3, 4]))
-    assert np.all(f == np.array([2, 3, 4]))
+    assert X[0].shape == (20, 14, 10)
+    assert X[1].shape == (20, 14, 10)
+    assert X[2].shape == (20, 10, 10)
+    assert X[3].shape == (20, 10, 10)
+    assert np.all(X[4] == np.array([2, 3, 4]))
+    assert np.all(X[5] == np.array([2, 3, 4]))
+    assert np.all(X[6] == np.array([2, 4, 4]))
+    assert np.all(X[7] == np.array([2, 4, 4]))
 
 
 def test_images_to_sitk(
@@ -72,7 +75,8 @@ def test_images_to_sitk(
     a, b, c, d = align.images_to_sitk(
         dummy_fix_image, dummy_mov_image,
         dummy_fix_image, dummy_mov_image,
-        (1,)*3, (2,)*3, (1, 2, 3), (4, 5, 6),
+        (1,)*3, (2,)*3, (1,)*3, (2,)*3,
+        (1, 2, 3), (4, 5, 6),
     )
     assert isinstance(a, sitk.Image)
     assert isinstance(b, sitk.Image)
@@ -200,7 +204,7 @@ def test_deformable_align(
     deform = align.deformable_align(
         dummy_fix_image, dummy_mov_image,
         (1.,)*3, (1.,)*3, 10.0, (1,),
-        static_moving_transform_list=[rigid,],
+        static_transform_list=[rigid,],
         metric='MS',
         optimizer_args={
             'learningRate':.1,

@@ -7,7 +7,7 @@ from CircuitSeeker.transform import apply_transform
 from CircuitSeeker.metrics import patch_mutual_information
 
 
-def skip_sample_images(
+def resolve_sampling(
     fix,
     mov,
     fix_mask,
@@ -17,14 +17,28 @@ def skip_sample_images(
     alignment_spacing,
 ):
     """
-    Convenience function for skip sampling all inputs to alignment_spacing
+    Get mask spacings and skip sample all inputs to alignment_spacing
     """
 
-    fix, fix_spacing_ss = ut.skip_sample(fix, fix_spacing, alignment_spacing)
-    mov, mov_spacing_ss = ut.skip_sample(mov, mov_spacing, alignment_spacing)
-    if fix_mask is not None: fix_mask, _ = ut.skip_sample(fix_mask, fix_spacing, alignment_spacing)
-    if mov_mask is not None: mov_mask, _ = ut.skip_sample(mov_mask, mov_spacing, alignment_spacing)
-    return fix, mov, fix_mask, mov_mask, fix_spacing_ss, mov_spacing_ss
+    # get mask spacings
+    fix_mask_spacing = None
+    if fix_mask is not None:
+        fix_mask_spacing = ut.relative_spacing(fix_mask, fix, fix_spacing)
+    mov_mask_spacing = None
+    if mov_mask is not None:
+        mov_mask_spacing = ut.relative_spacing(mov_mask, mov, mov_spacing)
+
+    # skip sample
+    if alignment_spacing:
+        fix, fix_spacing = ut.skip_sample(fix, fix_spacing, alignment_spacing)
+        mov, mov_spacing = ut.skip_sample(mov, mov_spacing, alignment_spacing)
+        if fix_mask is not None:
+            fix_mask, fix_mask_spacing = ut.skip_sample(fix_mask, fix_mask_spacing, alignment_spacing)
+        if mov_mask is not None:
+            mov_mask, mov_mask_spacing = ut.skip_sample(mov_mask, mov_mask_spacing, alignment_spacing)
+
+    return (fix, mov, fix_mask, mov_mask,
+            fix_spacing, mov_spacing, fix_mask_spacing, mov_mask_spacing,)
 
 
 def images_to_sitk(
@@ -34,6 +48,8 @@ def images_to_sitk(
     mov_mask,
     fix_spacing,
     mov_spacing,
+    fix_mask_spacing,
+    mov_mask_spacing,
     fix_origin,
     mov_origin,
 ):
@@ -43,8 +59,8 @@ def images_to_sitk(
 
     fix = sitk.Cast(ut.numpy_to_sitk(fix, fix_spacing, origin=fix_origin), sitk.sitkFloat32)
     mov = sitk.Cast(ut.numpy_to_sitk(mov, mov_spacing, origin=mov_origin), sitk.sitkFloat32)
-    if fix_mask is not None: fix_mask = ut.numpy_to_sitk(fix_mask, fix_spacing, origin=fix_origin)
-    if mov_mask is not None: mov_mask = ut.numpy_to_sitk(mov_mask, mov_spacing, origin=mov_origin)
+    if fix_mask is not None: fix_mask = ut.numpy_to_sitk(fix_mask, fix_mask_spacing, origin=fix_origin)
+    if mov_mask is not None: mov_mask = ut.numpy_to_sitk(mov_mask, mov_mask_spacing, origin=mov_origin)
     return fix, mov, fix_mask, mov_mask
 
 
@@ -126,9 +142,15 @@ def random_affine_search(
 
     fix_mask : binary ndarray (default: None)
         A mask limiting metric evaluation region of the fixed image
+        Assumed to have the same domain as the fixed image, though sampling
+        can be different. I.e. the origin and span are the same (in phyiscal
+        units) but the number of voxels can be different.
 
     mov_mask : binary ndarray (default: None)
         A mask limiting metric evaluation region of the moving image
+        Assumed to have the same domain as the moving image, though sampling
+        can be different. I.e. the origin and span are the same (in phyiscal
+        units) but the number of voxels can be different.
 
     fix_origin : 1d array (default: None)
         Origin of the fixed image.
@@ -195,11 +217,21 @@ def random_affine_search(
     if max_shear: params[1:, 9:] = F(max_shear)
     center = np.array(fix.shape) / 2 * fix_spacing  # center of rotation
 
-    # skip sample to alignment spacing
-    if alignment_spacing:
-        fix, mov, fix_mask, mov_mask, fix_spacing, mov_spacing = skip_sample_images(
-            fix, mov, fix_mask, mov_mask, fix_spacing, mov_spacing, alignment_spacing,
-        )
+    # skip sample and determine mask spacings
+    X = resolve_sampling(
+        fix, mov,
+        fix_mask, mov_mask,
+        fix_spacing, mov_spacing,
+        alignment_spacing,
+    )
+    fix = X[0]
+    mov = X[1]
+    fix_mask = X[2]
+    mov_mask = X[3]
+    fix_spacing = X[4]
+    mov_spacing = X[5]
+    fix_mask_spacing = X[6]
+    mov_mask_spacing = X[7]
 
     # specify static transform data explicitly
     static_transform_spacing = []
@@ -230,7 +262,7 @@ def random_affine_search(
             mov_mask_aligned = None
             if mov_mask is not None:
                 mov_mask_aligned = apply_transform(
-                    fix, mov_mask, fix_spacing, mov_spacing,
+                    fix_mask, mov_mask, fix_mask_spacing, mov_mask_spacing,
                     transform_list=transform_list,
                     fix_origin=fix_origin,
                     mov_origin=mov_origin,
@@ -239,6 +271,8 @@ def random_affine_search(
                     interpolate_with_nn=True,
                 )
             # evaluate metric
+            # TODO: this function needs to be updated for different
+            #       mask and image sizes
             return patch_mutual_information(
                 fix, aligned, fix_spacing,
                 fix_mask=fix_mask,
@@ -255,7 +289,9 @@ def random_affine_search(
         irm = configure_irm(**kwargs)
         fix, mov, fix_mask, mov_mask = images_to_sitk(
             fix, mov, fix_mask, mov_mask,
-            fix_spacing, mov_spacing, fix_origin, mov_origin,
+            fix_spacing, mov_spacing,
+            fix_mask_spacing, mov_mask_spacing,
+            fix_origin, mov_origin,
         )
         if fix_mask is not None: irm.SetMetricFixedMask(fix_mask)
         if mov_mask is not None: irm.SetMetricMovingMask(mov_mask)
@@ -346,9 +382,15 @@ def affine_align(
 
     fix_mask : binary ndarray (default: None)
         A mask limiting metric evaluation region of the fixed image
+        Assumed to have the same domain as the fixed image, though sampling
+        can be different. I.e. the origin and span are the same (in phyiscal
+        units) but the number of voxels can be different.
 
     mov_mask : binary ndarray (default: None)
         A mask limiting metric evaluation region of the moving image
+        Assumed to have the same domain as the moving image, though sampling
+        can be different. I.e. the origin and span are the same (in phyiscal
+        units) but the number of voxels can be different.
 
     fix_origin : 1d array (default: None)
         Origin of the fixed image.
@@ -385,13 +427,19 @@ def affine_align(
         default = initial_condition
 
     # skip sample and convert inputs to sitk images
-    if alignment_spacing:
-        fix, mov, fix_mask, mov_mask, fix_spacing, mov_spacing = skip_sample_images(
-            fix, mov, fix_mask, mov_mask, fix_spacing, mov_spacing, alignment_spacing,
-        )
-    fix, mov, fix_mask, mov_mask = images_to_sitk(
-        fix, mov, fix_mask, mov_mask, fix_spacing, mov_spacing, fix_origin, mov_origin,
+    X = resolve_sampling(
+        fix, mov,
+        fix_mask, mov_mask,
+        fix_spacing, mov_spacing,
+        alignment_spacing,
     )
+    fix, mov, fix_mask, mov_mask = images_to_sitk(
+        *X, fix_origin, mov_origin,
+    )
+    fix_spacing = X[4]
+    mov_spacing = X[5]
+    fix_mask_spacing = X[6]
+    mov_mask_spacing = X[7]
 
     # specify static transform data explicitly
     static_transform_spacing = []
@@ -511,9 +559,15 @@ def deformable_align(
 
     fix_mask : binary ndarray (default: None)
         A mask limiting metric evaluation region of the fixed image
+        Assumed to have the same domain as the fixed image, though sampling
+        can be different. I.e. the origin and span are the same (in phyiscal
+        units) but the number of voxels can be different.
 
     mov_mask : binary ndarray (default: None)
         A mask limiting metric evaluation region of the moving image
+        Assumed to have the same domain as the moving image, though sampling
+        can be different. I.e. the origin and span are the same (in phyiscal
+        units) but the number of voxels can be different.
 
     fix_origin : 1d array (default: None)
         Origin of the fixed image.
@@ -555,13 +609,19 @@ def deformable_align(
     initial_fix_shape = fix.shape
 
     # skip sample and convert inputs to sitk images
-    if alignment_spacing:
-        fix, mov, fix_mask, mov_mask, fix_spacing, mov_spacing = skip_sample_images(
-            fix, mov, fix_mask, mov_mask, fix_spacing, mov_spacing, alignment_spacing,
-        )
-    fix, mov, fix_mask, mov_mask = images_to_sitk(
-        fix, mov, fix_mask, mov_mask, fix_spacing, mov_spacing, fix_origin, mov_origin,
+    X = resolve_sampling(
+        fix, mov,
+        fix_mask, mov_mask,
+        fix_spacing, mov_spacing,
+        alignment_spacing,
     )
+    fix, mov, fix_mask, mov_mask = images_to_sitk(
+        *X, fix_origin, mov_origin,
+    )
+    fix_spacing = X[4]
+    mov_spacing = X[5]
+    fix_mask_spacing = X[6]
+    mov_mask_spacing = X[7]
 
     # specify static transform data explicitly
     static_transform_spacing = []
@@ -680,9 +740,15 @@ def alignment_pipeline(
 
     fix_mask : binary ndarray (default: None)
         A mask limiting metric evaluation region of the fixed image
+        Assumed to have the same domain as the fixed image, though sampling
+        can be different. I.e. the origin and span are the same (in phyiscal
+        units) but the number of voxels can be different.
 
     mov_mask : binary ndarray (default: None)
         A mask limiting metric evaluation region of the moving image
+        Assumed to have the same domain as the moving image, though sampling
+        can be different. I.e. the origin and span are the same (in phyiscal
+        units) but the number of voxels can be different.
 
     fix_origin : 1d array (default: None)
         Origin of the fixed image.
