@@ -6,6 +6,7 @@ from ClusterWrap.decorator import cluster
 import CircuitSeeker.utility as ut
 from CircuitSeeker.align import alignment_pipeline
 from CircuitSeeker.transform import apply_transform
+from CircuitSeeker.transform import apply_transform_to_coordinates
 from CircuitSeeker.transform import compose_transforms
 
 
@@ -164,18 +165,14 @@ def distributed_piecewise_alignment_pipeline(
 
     # zarr files for initial deformations, get initial deform spacings
     new_list = []
-    static_transform_spacing = []
     for iii, transform in enumerate(static_transform_list):
-        spacing = fix_spacing
         if transform.shape != (4, 4) and len(transform.shape) != 1:
-            spacing = ut.relative_spacing(transform, fix, fix_spacing)
             path = temporary_directory + f'/deform{iii}.zarr'
             transform = ut.numpy_to_zarr(transform, zarr_blocks + (transform.shape[-1],), path)
-        static_transform_spacing.append(spacing)
         new_list.append(transform)
     static_transform_list = new_list
 
-    # determine indices for blocking
+    # determine fixed image slices for blocking
     blocksize = np.ceil( np.array(fix.shape) / nblocks ).astype(int)
     overlaps = np.round(blocksize * overlap).astype(int)
     indices = []
@@ -197,57 +194,74 @@ def distributed_piecewise_alignment_pipeline(
     def align_single_block(
         indices,
         static_transform_list,
-        static_transform_spacing,
     ):
 
         # get the coordinates, read fixed data
-        block_index, coords = indices[:3], indices[3]
-        fix_start = [s.start for s in coords]
-        fix_stop = [s.stop for s in coords]
-        fix_start_xyz = fix_spacing * fix_start
-        fix_stop_xyz = fix_spacing * fix_stop
-        fix = fix_zarr[coords]
+        block_index, fix_slices = indices[:3], indices[3]
+        fix = fix_zarr[fix_slices]
+
+        # get fixed image block corners in physical units
+        fix_block_coords = []
+        for corner in list(product([0, 1], repeat=3)):
+            a = [x.stop if y else x.start for x, y in zip(fix_slices, corner)]
+            fix_block_coords.append(a)
+        fix_block_coords = np.array(fix_block_coords)
+        fix_block_coords_phys = fix_block_coords * fix_spacing
 
         # parse initial transforms
-        # recenter affines, zoom deforms, get moving coords, read moving data
+        # recenter affines, read deforms, apply transforms to crop coordinates
         new_list = []
-        mov_start_xyz = np.copy(fix_start_xyz)
-        mov_stop_xyz = np.copy(fix_stop_xyz)
+        mov_block_coords_phys = np.copy(fix_block_coords_phys)
         for transform in static_transform_list[::-1]:
             if transform.shape == (4, 4):
-                mov_start_xyz = np.matmul(transform, tuple(mov_start_xyz) + (1,))[:-1]
-                mov_stop_xyz = np.matmul(transform, tuple(mov_stop_xyz) + (1,))[:-1]
-                transform = ut.change_affine_matrix_origin(transform, -fix_start_xyz)
+                mov_block_coords_phys = apply_transform_to_coordinates(
+                    mov_block_coords_phys, transform,
+                )
+                transform = ut.change_affine_matrix_origin(transform, -fix_block_coords_phys[0])
             else:
                 ratio = np.array(transform.shape[:-1]) / fix_zarr.shape
-                trans_start = np.round( ratio * fix_start ).astype(int)
-                trans_stop = np.round( ratio * fix_stop ).astype(int)
-                transform_coords = tuple(slice(a, b) for a, b in zip(trans_start, trans_stop))
-                transform = transform[transform_coords]
-                mov_start_xyz += transform[(0,) * len(coords)]
-                mov_stop_xyz += transform[(-1,) * len(coords)]
+                start = np.round( ratio * fix_block_coords[0] ).astype(int)
+                stop = np.round( ratio * fix_block_coords[-1] ).astype(int)
+                transform_slices = tuple(slice(a, b) for a, b in zip(start, stop))
+                transform = transform[transform_slices]
+                spacing = ut.relative_spacing(transform, fix, fix_spacing)
+                mov_block_coords_phys = apply_transform_to_coordinates(
+                    mov_block_coords_phys, transform, spacing,
+                )
             new_list.append(transform)
         static_transform_list = new_list[::-1]
-        mov_start = np.floor( mov_start_xyz / mov_spacing ).astype(int)
-        mov_start = np.maximum(0, mov_start)
-        mov_stop = np.ceil( mov_stop_xyz / mov_spacing ).astype(int)
-        mov_stop = np.minimum(mov_zarr.shape, mov_stop)
-        mov_coords = tuple(slice(a, b) for a, b in zip(mov_start, mov_stop))
-        mov = mov_zarr[mov_coords]
 
-        # TODO: these may not be the right shape
+        # get moving image crop, read moving data 
+        mov_block_coords = np.round(mov_block_coords_phys / mov_spacing).astype(int)
+        mov_start = np.min(mov_block_coords, axis=0)
+        mov_stop = np.max(mov_block_coords, axis=0)
+        mov_slices = tuple(slice(a, b) for a, b in zip(mov_start, mov_stop))
+        mov = mov_zarr[mov_slices]
+
         # read masks
         fix_mask, mov_mask = None, None
-        if os.path.isdir(fix_mask_zarr_path): fix_mask = fix_mask_zarr[coords]
-        if os.path.isdir(mov_mask_zarr_path): mov_mask = mov_mask_zarr[mov_coords]
+        if os.path.isdir(fix_mask_zarr_path):
+            ratio = np.array(fix_mask_zarr.shape) / fix_zarr.shape
+            start = np.round( ratio * fix_block_coords[0] ).astype(int)
+            stop = np.round( ratio * fix_block_coords[-1] ).astype(int)
+            fix_mask_slices = tuple(slice(a, b) for a, b in zip(start, stop))
+            fix_mask = fix_mask_zarr[fix_mask_slices]
+        if os.path.isdir(mov_mask_zarr_path):
+            ratio = np.array(mov_mask_zarr.shape) / mov_zarr.shape
+            start = np.round( ratio * mov_start ).astype(int)
+            stop = np.round( ratio * mov_stop ).astype(int)
+            mov_mask_slices = tuple(slice(a, b) for a, b in zip(start, stop))
+            mov_mask = mov_mask_zarr[mov_mask_slices]
+
+        # get moving image origin
+        mov_origin = mov_start * mov_spacing - fix_block_coords_phys[0]
 
         # run alignment pipeline
         transform = alignment_pipeline(
             fix, mov, fix_spacing, mov_spacing, steps,
             fix_mask=fix_mask, mov_mask=mov_mask,
-            mov_origin=mov_start_xyz - fix_start_xyz,
+            mov_origin=mov_origin,
             static_transform_list=static_transform_list,
-            static_transform_spacing=static_transform_spacing,
             random_kwargs=random_kwargs,
             rigid_kwargs=rigid_kwargs,
             affine_kwargs=affine_kwargs,
@@ -295,7 +309,6 @@ def distributed_piecewise_alignment_pipeline(
         futures = cluster.client.map(
             align_single_block, indices,
             static_transform_list=static_transform_list,
-            static_transform_spacing=static_transform_spacing,
         )
         future_keys = [f.key for f in futures]
 
@@ -343,7 +356,6 @@ def distributed_piecewise_alignment_pipeline(
             futures = cluster.client.map(
                 align_single_block, partition,
                 static_transform_list=static_transform_list,
-                static_transform_spacing=static_transform_spacing,
             )
             future_keys = [f.key for f in futures]
 
