@@ -20,9 +20,7 @@ def distributed_piecewise_alignment_pipeline(
     overlap=0.5,
     fix_mask=None,
     mov_mask=None,
-    static_moving_transform_list=[],
-    static_moving_transform_spacing=None,
-    static_moving_transform_origin=None,
+    static_transform_list=[],
     random_kwargs={},
     rigid_kwargs={},
     affine_kwargs={},
@@ -31,6 +29,7 @@ def distributed_piecewise_alignment_pipeline(
     cluster_kwargs={},
     temporary_directory=None,
     write_path=None,
+    n_serial_partitions=1,
     **kwargs,
 ):
     """
@@ -75,23 +74,21 @@ def distributed_piecewise_alignment_pipeline(
 
     fix_mask : binary ndarray (default: None)
         A mask limiting metric evaluation region of the fixed image
+        Assumed to have the same domain as the fixed image, though sampling
+        can be different. I.e. the origin and span are the same (in physical
+        units) but the number of voxels can be different.
 
     mov_mask : binary ndarray (default: None)
         A mask limiting metric evaluation region of the moving image
-        Due to the distribution aspect, if a mov_mask is provided
-        you must also provide a fix_mask. A reasonable choice if
-        no fix_mask exists is an array of all ones.
+        Assumed to have the same domain as the moving image, though sampling
+        can be different. I.e. the origin and span are the same (in physical
+        units) but the number of voxels can be different.
 
-    static_moving_transform_list : list of numpy arrays (default: [])
+    static_transform_list : list of numpy arrays (default: [])
         Transforms applied to moving image before applying query transform
-
-    static_moving_transform_spacing : np.ndarray or tuple of np.ndarray (default: None)
-        Spacing of transforms in static_moving_transform_list
-        Only necessary for displacement field transforms.
-
-    static_moving_transform_origin : np.ndarray or tuple of np.ndarray (default: None)
-        Origin of transforms in static_moving_transform_list
-        Only necessary for displacement field transforms.
+        Assumed to have the same domain as the fixed image, though sampling
+        can be different. I.e. the origin and span are the same (in physical
+        units) but the number of voxels can be different.
 
     random_kwargs : dict (default: {})
         Arguments passed to `random_affine_search`
@@ -132,6 +129,12 @@ def distributed_piecewise_alignment_pipeline(
         process memory, set this parameter to a location where the transform
         can be written to disk as a zarr file.
 
+    n_serial_partitions : int (default: 1)
+        The number of sets of parallel computations to run. Very large alignments
+        can overwhelm the resources of even a large cluster. This can be solved
+        by ordering the computations in a way that fits into the requested
+        resources. 
+
     kwargs : any additional arguments
         Arguments that will apply to all alignment steps. These are overruled by
         arguments for specific steps e.g. `random_kwargs` etc.
@@ -159,14 +162,18 @@ def distributed_piecewise_alignment_pipeline(
     if fix_mask is not None: fix_mask_zarr = ut.numpy_to_zarr(fix_mask, zarr_blocks, fix_mask_zarr_path)
     if mov_mask is not None: mov_mask_zarr = ut.numpy_to_zarr(mov_mask, zarr_blocks, mov_mask_zarr_path)
 
-    # zarr files for initial deformations
+    # zarr files for initial deformations, get initial deform spacings
     new_list = []
-    for iii, transform in enumerate(static_moving_transform_list):
-        if transform.shape != (4, 4):
+    static_transform_spacing = []
+    for iii, transform in enumerate(static_transform_list):
+        spacing = fix_spacing
+        if transform.shape != (4, 4) and len(transform.shape) != 1:
+            spacing = ut.relative_spacing(transform, fix, fix_spacing)
             path = temporary_directory + f'/deform{iii}.zarr'
             transform = ut.numpy_to_zarr(transform, zarr_blocks + (transform.shape[-1],), path)
+        static_transform_spacing.append(spacing)
         new_list.append(transform)
-    static_moving_transform_list = new_list
+    static_transform_list = new_list
 
     # determine indices for blocking
     blocksize = np.ceil( np.array(fix.shape) / nblocks ).astype(int)
@@ -189,8 +196,8 @@ def distributed_piecewise_alignment_pipeline(
     # closure for alignment pipeline
     def align_single_block(
         indices,
-        static_moving_transform_list,
-        static_moving_transform_spacing,
+        static_transform_list,
+        static_transform_spacing,
     ):
 
         # get the coordinates, read fixed data
@@ -206,7 +213,7 @@ def distributed_piecewise_alignment_pipeline(
         new_list = []
         mov_start_xyz = np.copy(fix_start_xyz)
         mov_stop_xyz = np.copy(fix_stop_xyz)
-        for transform in static_moving_transform_list[::-1]:
+        for transform in static_transform_list[::-1]:
             if transform.shape == (4, 4):
                 mov_start_xyz = np.matmul(transform, tuple(mov_start_xyz) + (1,))[:-1]
                 mov_stop_xyz = np.matmul(transform, tuple(mov_stop_xyz) + (1,))[:-1]
@@ -220,7 +227,7 @@ def distributed_piecewise_alignment_pipeline(
                 mov_start_xyz += transform[(0,) * len(coords)]
                 mov_stop_xyz += transform[(-1,) * len(coords)]
             new_list.append(transform)
-        static_moving_transform_list = new_list[::-1]
+        static_transform_list = new_list[::-1]
         mov_start = np.floor( mov_start_xyz / mov_spacing ).astype(int)
         mov_start = np.maximum(0, mov_start)
         mov_stop = np.ceil( mov_stop_xyz / mov_spacing ).astype(int)
@@ -239,8 +246,8 @@ def distributed_piecewise_alignment_pipeline(
             fix, mov, fix_spacing, mov_spacing, steps,
             fix_mask=fix_mask, mov_mask=mov_mask,
             mov_origin=mov_start_xyz - fix_start_xyz,
-            static_moving_transform_list=static_moving_transform_list,
-            static_moving_transform_spacing=static_moving_transform_spacing,
+            static_transform_list=static_transform_list,
+            static_transform_spacing=static_transform_spacing,
             random_kwargs=random_kwargs,
             rigid_kwargs=rigid_kwargs,
             affine_kwargs=affine_kwargs,
@@ -281,16 +288,17 @@ def distributed_piecewise_alignment_pipeline(
         return transform * weights[..., None]
     # END CLOSURE
 
-    # submit all alignments to cluster
-    futures = cluster.client.map(
-        align_single_block, indices,
-        static_moving_transform_list=static_moving_transform_list,
-        static_moving_transform_spacing=static_moving_transform_spacing,
-    )
-    future_keys = [f.key for f in futures]
-
     # for small alignments
     if not write_path:
+
+        # submit all alignments to cluster
+        futures = cluster.client.map(
+            align_single_block, indices,
+            static_transform_list=static_transform_list,
+            static_transform_spacing=static_transform_spacing,
+        )
+        future_keys = [f.key for f in futures]
+
         # initialize container, monitor progress, write blocks when finished
         transform = np.zeros(fix.shape + (fix.ndim,), dtype=np.float32)
         for batch in as_completed(futures, with_results=True).batches():
@@ -307,29 +315,52 @@ def distributed_piecewise_alignment_pipeline(
         def write_block(coords, block):
             transform[coords] = transform[coords] + block
 
-        # function for getting neighbor indices
-        neighbor_offsets = np.array(list(product(range(-1, 2), repeat=3)))
-        def neighbor_indices(index):
-            lock_indices = (index + neighbor_offsets).transpose()
-            not_too_low = lock_indices.min(axis=0) >= 0
-            not_too_high = np.all(lock_indices < np.array(nblocks)[:, None], axis=0)
-            lock_indices = lock_indices[:, not_too_low * not_too_high]
-            return np.ravel_multi_index(lock_indices, nblocks)
+        # split into serial partitions
+        a = len(indices) // n_serial_partitions
+        b = len(indices) % n_serial_partitions
+        partitions = [indices[0:a+b],]
+        partitions += [indices[b+i*a:b+(i+1)*a] for i in range(1, n_serial_partitions)]
 
-        # write blocks as parallel as possible
-        written = np.zeros(len(futures), dtype=bool)
-        while not np.all(written):
-            writing_futures = []
-            locked = np.zeros(len(futures), dtype=bool)
-            for future in futures:
-                iii = future_keys.index(future.key)
-                if future.done() and not written[iii] and not locked[iii]:
-                    f = cluster.client.submit(write_block, indices[iii][3], future)
-                    locked[neighbor_indices(indices[iii][:3])] = True
-                    writing_futures.append(f)
-                    written[iii] = True
-            wait(writing_futures)
-            
+        # functions for getting neighbor indices
+        neighbor_offsets = np.array(list(product([-1, 0, 1], repeat=3)))
+        def original_neighbor_indices(index):
+            lock_indices = index + neighbor_offsets
+            not_too_low = lock_indices.min(axis=1) >= 0
+            not_too_high = np.all(lock_indices < nblocks, axis=1)
+            lock_indices = lock_indices[not_too_low * not_too_high, :]
+            return np.ravel_multi_index(lock_indices.transpose(), nblocks)
+        def partition_neighbor_indices(indices, partition_number):
+            offset = int(np.sum([len(x) for x in partitions[:partition_number]]))
+            indices = original_neighbor_indices(indices) - offset
+            not_too_low = indices >= 0
+            not_too_high = indices < len(partitions[partition_number])
+            return indices[not_too_low * not_too_high]
+
+        # submit partitions in series
+        for iii, partition in enumerate(partitions):
+
+            # submit partition to cluster
+            futures = cluster.client.map(
+                align_single_block, partition,
+                static_transform_list=static_transform_list,
+                static_transform_spacing=static_transform_spacing,
+            )
+            future_keys = [f.key for f in futures]
+
+            # write blocks as parallel as possible
+            written = np.zeros(len(futures), dtype=bool)
+            while not np.all(written):
+                writing_futures = []
+                locked = np.zeros(len(futures), dtype=bool)
+                for future in futures:
+                    jjj = future_keys.index(future.key)
+                    if future.done() and not written[jjj] and not locked[jjj]:
+                        f = cluster.client.submit(write_block, partition[jjj][3], future)
+                        locked[partition_neighbor_indices(partition[jjj][:3], iii)] = True
+                        writing_futures.append(f)
+                        written[jjj] = True
+                wait(writing_futures)
+
     # remove temporary files and return
     shutil.rmtree(temporary_directory)
     return transform
