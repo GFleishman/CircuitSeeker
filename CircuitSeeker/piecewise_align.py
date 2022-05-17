@@ -225,8 +225,9 @@ def distributed_piecewise_alignment_pipeline(
                 transform_slices = tuple(slice(a, b) for a, b in zip(start, stop))
                 transform = transform[transform_slices]
                 spacing = ut.relative_spacing(transform, fix, fix_spacing)
+                origin = spacing * [s.start for s in transform_slices]
                 mov_block_coords_phys = apply_transform_to_coordinates(
-                    mov_block_coords_phys, transform, spacing,
+                    mov_block_coords_phys, transform, spacing, origin
                 )
             new_list.append(transform)
         static_transform_list = new_list[::-1]

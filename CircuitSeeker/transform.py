@@ -1,4 +1,5 @@
 import numpy as np
+from itertools import product
 import SimpleITK as sitk
 import CircuitSeeker.utility as ut
 import os, psutil, shutil
@@ -36,8 +37,9 @@ def apply_transform(
 
     # construct transform
     fix_spacing = np.array(fix_spacing)
+    if transform_spacing is None: transform_spacing = fix_spacing
     transform = ut.transform_list_to_composite_transform(
-        transform_list, transform_spacing or fix_spacing, transform_origin,
+        transform_list, transform_spacing, transform_origin,
     )
 
     # set up resampler object
@@ -66,7 +68,6 @@ def distributed_apply_transform(
     transform_list,
     blocksize,
     write_path,
-    transform_spacing=None,
     dataset_path=None,
     temporary_directory=None,
     cluster=None,
@@ -77,8 +78,6 @@ def distributed_apply_transform(
 
     # TODO: generalize
     affine, deform = transform_list
-
-    # blocksize should be an array
     blocksize = np.array(blocksize)
 
     # ensure temporary directory exists
@@ -86,8 +85,6 @@ def distributed_apply_transform(
         temporary_directory = os.getcwd()
     temporary_directory += '/distributed_apply_transform_temp'
     os.makedirs(temporary_directory)
-
-    # write deform as zarr file
     zarr_path = temporary_directory + '/deform.zarr'
     zarr_blocks = (128,)*len(blocksize) + (3,)
     deform_zarr = ut.numpy_to_zarr(deform, zarr_blocks, zarr_path)
@@ -110,48 +107,49 @@ def distributed_apply_transform(
     # pipeline to run on each block
     def transform_single_block(coords):
 
-        # fetch coords slice and deform
-        coords = coords.item()
+        # fetch fixed image slices and read fix
+        fix_slices = coords.item()
+        fix = fix_zarr[fix_slices]
 
-        # read relevant part of transform
-        # TODO: double check transform origin for example, make sure no error being introduced!
-        deform_coords = coords
+        # get deform slices and read deform
+        deform_slices = fix_slices
         if fix_zarr.shape != deform_zarr.shape[:-1]:
             ratio = np.array(deform_zarr.shape[:-1]) / fix_zarr.shape
-            starts = np.round([s.start * r for s, r in zip(coords, ratio)]).astype(int)
-            stops = np.round([s.stop * r for s, r in zip(coords, ratio)]).astype(int)
-            deform_coords = tuple(slice(a, b) for a, b in zip(starts, stops))
-        deform = deform_zarr[deform_coords]
+            start = np.round([s.start * r for s, r in zip(fix_slices, ratio)]).astype(int)
+            stop = np.round([s.stop * r for s, r in zip(fix_slices, ratio)]).astype(int)
+            deform_slices = tuple(slice(a, b) for a, b in zip(start, stop))
+        deform = deform_zarr[deform_slices]
 
-        # determine bounding box around moving image region
-        # get initial voxel coords
-        start_ijk = tuple(s.start for s in coords)
-        stop_ijk = tuple(s.stop for s in coords)
+        # get fixed block corners in physical units
+        fix_block_coords = []
+        for corner in list(product([0, 1], repeat=3)):
+            a = [x.stop if y else x.start for x, y in zip(fix_slices, corner)]
+            fix_block_coords.append(a)
+        fix_block_coords = np.array(fix_block_coords)
+        fix_block_coords_phys = fix_block_coords * fix_spacing
 
-        # convert to physical units, add the displacements
-        start_xyz = np.array(start_ijk) * fix_spacing + deform[(0,)*len(coords)]
-        stop_xyz = np.array(stop_ijk) * fix_spacing + deform[(-1,)*len(coords)]
+        # transform fix block coordinates
+        transform_spacing = ut.relative_spacing(deform, fix, fix_spacing)
+        transform_origin = transform_spacing * [s.start for s in deform_slices]
+        mov_block_coords_phys = apply_transform_to_coordinates(
+            fix_block_coords_phys, deform, transform_spacing, transform_spacing,
+        )
+        mov_block_coords_phys = apply_transform_to_coordinates(
+            mov_block_coords_phys, affine,
+        )
 
-        # apply the affine
-        start_mov_xyz = np.matmul(affine, np.concatenate((start_xyz, (1,))))
-        stop_mov_xyz = np.matmul(affine, np.concatenate((stop_xyz, (1,))))
+        # get moving block slices
+        mov_block_coords = np.round(mov_block_coords_phys / mov_spacing).astype(int)
+        mov_block_coords = np.maximum(0, mov_block_coords)
+        mov_block_coords = np.minimum(np.array(mov_zarr.shape)-1, mov_block_coords)
+        mov_start = np.min(mov_block_coords, axis=0)
+        mov_stop = np.max(mov_block_coords, axis=0)
+        mov_slices = tuple(slice(a, b) for a, b in zip(mov_start, mov_stop))
+        mov = mov_zarr[mov_slices]
 
-        # convert to voxel units, take outer box, ensure coords within range
-        start_mov = np.floor(start_mov_xyz[:-1] / mov_spacing).astype(int)
-        start_mov = np.maximum(0, start_mov)
-        stop_mov = np.ceil(stop_mov_xyz[:-1] / mov_spacing).astype(int)
-        stop_mov = np.minimum(mov_zarr.shape, stop_mov)
-
-        # convert back to tuple of slice
-        mov_coords = tuple(slice(a, b) for a, b in zip(start_mov, stop_mov))
-
-        # read the data
-        fix = fix_zarr[coords]
-        mov = mov_zarr[mov_coords]
-
-        # determine origin
-        fix_origin = fix_spacing * [s.start for s in coords]
-        mov_origin = mov_spacing * [s.start for s in mov_coords]
+        # determine origins
+        fix_origin = fix_spacing * [s.start for s in fix_slices]
+        mov_origin = mov_spacing * [s.start for s in mov_slices]
 
         # resample
         aligned = apply_transform(
@@ -168,7 +166,7 @@ def distributed_apply_transform(
 
             # left side
             slc = [slice(None),]*aligned.ndim
-            if coords[axis].start != 0:
+            if fix_slices[axis].start != 0:
                 slc[axis] = slice(overlap[axis], None)
                 aligned = aligned[tuple(slc)]
 
@@ -202,10 +200,12 @@ def distributed_apply_transform(
     return zarr.open(write_path, 'r+')
 
 
+# TODO: this function should take a list of transforms
 def apply_transform_to_coordinates(
     coordinates,
     transform,
     transform_spacing=None,
+    transform_origin=None,
 ):
     """
     """
@@ -226,6 +226,7 @@ def apply_transform_to_coordinates(
         assert (transform_spacing is not None), error_message
 
         # get coordinates in transform voxel units, reformat for map_coordinates
+        if transform_origin is not None: coordinates -= transform_origin
         coordinates = ( coordinates / transform_spacing ).transpose()
 
         # interpolate position field at coordinates, reformat, return
