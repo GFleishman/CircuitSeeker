@@ -223,3 +223,80 @@ def distributed_apply_transform_to_coordinates(
 
     return np.concatenate(results, axis=0)
 
+
+@cluster
+def distributed_invert_displacement_vector_field(
+    field_zarr,
+    spacing,
+    blocksize,
+    write_path,
+    iterations=10,
+    order=2,
+    sqrt_iterations=5,
+    cluster=None,
+    cluster_kwargs={},
+):
+    """
+    """
+
+    # get overlap and number of blocks
+    blocksize = np.array(blocksize)
+    overlap = np.round(blocksize * 0.25).astype(int)
+    nblocks = np.ceil(np.array(field_zarr.shape[:-1]) / blocksize).astype(int)
+
+    # store block coordinates in a dask array
+    block_coords = np.empty(nblocks, dtype=tuple)
+    for (i, j, k) in np.ndindex(*nblocks):
+        start = blocksize * (i, j, k) - overlap
+        stop = start + blocksize + 2 * overlap
+        start = np.maximum(0, start)
+        stop = np.minimum(field_zarr.shape[:-1], stop)
+        coords = tuple(slice(x, y) for x, y in zip(start, stop))
+        block_coords[i, j, k] = coords
+    block_coords = da.from_array(block_coords, chunks=(1,)*block_coords.ndim)
+
+
+    def invert_block(slices):
+
+        slices = slices.item()
+        field = field_zarr[slices]
+        inverse = transform.invert_displacement_vector_field(
+            field, spacing, iterations, order, sqrt_iterations,
+        )
+        
+        # crop out overlap
+        for axis in range(inverse.ndim - 1):
+
+            # left side
+            slc = [slice(None),]*(inverse.ndim - 1)
+            if slices[axis].start != 0:
+                slc[axis] = slice(overlap[axis], None)
+                inverse = inverse[tuple(slc)]
+
+            # right side
+            slc = [slice(None),]*(inverse.ndim - 1)
+            if inverse.shape[axis] > blocksize[axis]:
+                slc[axis] = slice(None, blocksize[axis])
+                inverse = inverse[tuple(slc)]
+
+        # return result
+        return inverse
+
+    # invert all blocks
+    inverse = da.map_blocks(
+        invert_block,
+        block_coords,
+        dtype=field_zarr.dtype,
+        new_axis=[3,],
+        chunks=tuple(blocksize) + (3,),
+    )
+
+    # crop to original size
+    inverse = inverse[tuple(slice(0, s) for s in field_zarr.shape[:-1])]
+
+    # compute result, write to zarr array
+    da.to_zarr(inverse, write_path)
+
+    # return reference to result
+    return zarr.open(write_path, 'r+')
+

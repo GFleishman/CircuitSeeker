@@ -66,7 +66,8 @@ def apply_transform_to_coordinates(
     """
     """
 
-    for iii, transform in enumerate(transform_list):
+    # transform list should be a stack, last added is first applied
+    for iii, transform in enumerate(transform_list)[::-1]:
 
         # if transform is an affine matrix
         if transform.shape == (4, 4):
@@ -170,11 +171,11 @@ def invert_displacement_vector_field(
 
     # iterate to invert
     for i in range(iterations):
-        inv -= compose_displacement_vector_fields(root, inv, spacing)
+        inv -= compose_transforms(root, inv, spacing)
 
     # square-compose inv order times
     for i in range(order):
-        inv = compose_displacement_vector_fields(inv, inv, spacing)
+        inv = compose_transforms(inv, inv, spacing)
 
     # return result
     return inv
@@ -215,7 +216,7 @@ def _displacement_field_composition_square_root(
 
     # iterate
     for i in range(iterations):
-        residual = (field - compose_displacement_vector_fields(root, root, spacing))
+        residual = (field - compose_transforms(root, root, spacing))
         root += 0.5 * residual
 
     # return result
