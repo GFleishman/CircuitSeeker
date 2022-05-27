@@ -67,7 +67,7 @@ def apply_transform_to_coordinates(
     """
 
     # transform list should be a stack, last added is first applied
-    for iii, transform in enumerate(transform_list)[::-1]:
+    for iii, transform in enumerate(transform_list[::-1]):
 
         # if transform is an affine matrix
         if transform.shape == (4, 4):

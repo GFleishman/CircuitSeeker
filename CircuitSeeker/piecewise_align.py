@@ -1,4 +1,4 @@
-import os, shutil
+import os, tempfile
 import numpy as np
 from itertools import product
 from dask.distributed import as_completed, wait
@@ -149,14 +149,14 @@ def distributed_piecewise_alignment_pipeline(
     """
 
     # temporary file paths and create zarr images
-    if temporary_directory is None:
-        temporary_directory = os.getcwd()
-    temporary_directory += '/distributed_alignment_temp'
-    os.makedirs(temporary_directory)
-    fix_zarr_path = temporary_directory + '/fix.zarr'
-    mov_zarr_path = temporary_directory + '/mov.zarr'
-    fix_mask_zarr_path = temporary_directory + '/fix_mask.zarr'
-    mov_mask_zarr_path = temporary_directory + '/mov_mask.zarr'
+    temporary_directory = temporary_directory or os.getcwd()
+    temporary_directory = tempfile.TemporaryDirectory(
+        prefix='.', dir=temporary_directory,
+    )
+    fix_zarr_path = temporary_directory.name + '/fix.zarr'
+    mov_zarr_path = temporary_directory.name + '/mov.zarr'
+    fix_mask_zarr_path = temporary_directory.name + '/fix_mask.zarr'
+    mov_mask_zarr_path = temporary_directory.name + '/mov_mask.zarr'
     zarr_blocks = (128,)*fix.ndim
     fix_zarr = ut.numpy_to_zarr(fix, zarr_blocks, fix_zarr_path)
     mov_zarr = ut.numpy_to_zarr(mov, zarr_blocks, mov_zarr_path)
@@ -167,7 +167,7 @@ def distributed_piecewise_alignment_pipeline(
     new_list = []
     for iii, transform in enumerate(static_transform_list):
         if transform.shape != (4, 4) and len(transform.shape) != 1:
-            path = temporary_directory + f'/deform{iii}.zarr'
+            path = temporary_directory.name + f'/deform{iii}.zarr'
             transform = ut.numpy_to_zarr(transform, zarr_blocks + (transform.shape[-1],), path)
         new_list.append(transform)
     static_transform_list = new_list
@@ -376,8 +376,6 @@ def distributed_piecewise_alignment_pipeline(
                         written[jjj] = True
                 wait(writing_futures)
 
-    # remove temporary files and return
-    shutil.rmtree(temporary_directory)
     return transform
 
 
