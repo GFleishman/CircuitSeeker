@@ -42,7 +42,7 @@ def distributed_apply_transform(
 
     # get overlap and number of blocks
     blocksize = np.array(blocksize)
-    overlap = np.round(blocksize * 0.5).astype(int)
+    overlap = np.round(blocksize * 0.5).astype(int)  # NOTE: overlap too big?
     nblocks = np.ceil(np.array(fix_zarr.shape) / blocksize).astype(int)
 
     # store block coordinates in a dask array
@@ -67,6 +67,7 @@ def distributed_apply_transform(
         # read relevant region of transforms
         new_list = []
         transform_spacing = [fix_spacing,] * len(transform_list)
+        transform_origin = fix_origin
         shape = fix_zarr.shape if not inverse_transforms else mov_zarr.shape
         for iii, transform in enumerate(transform_list):
             if transform.shape != (4, 4):
@@ -76,6 +77,7 @@ def distributed_apply_transform(
                 deform_slices = tuple(slice(a, b) for a, b in zip(start, stop))
                 transform = transform[deform_slices]
                 transform_spacing[iii] = fix_spacing / ratio
+                transform_origin = start * transform_spacing[iii]
             new_list.append(transform)
         transform_list = new_list
         transform_spacing = tuple(transform_spacing)
@@ -83,15 +85,15 @@ def distributed_apply_transform(
         # transform fixed block corners, read moving data
         fix_block_coords = []
         for corner in list(product([0, 1], repeat=3)):
-            a = [x.stop if y else x.start for x, y in zip(fix_slices, corner)]
+            a = [x.stop-1 if y else x.start for x, y in zip(fix_slices, corner)]
             fix_block_coords.append(a)
         fix_block_coords = np.array(fix_block_coords) * fix_spacing
         mov_block_coords = cs_transform.apply_transform_to_coordinates(
-            fix_block_coords, transform_list, transform_spacing, fix_origin,
+            fix_block_coords, transform_list, transform_spacing, transform_origin,
         )
         mov_block_coords = np.round(mov_block_coords / mov_spacing).astype(int)
         mov_block_coords = np.maximum(0, mov_block_coords)
-        mov_block_coords = np.minimum(np.array(mov_zarr.shape)-1, mov_block_coords)
+        mov_block_coords = np.minimum(mov_zarr.shape, mov_block_coords)
         mov_start = np.min(mov_block_coords, axis=0)
         mov_stop = np.max(mov_block_coords, axis=0)
         mov_slices = tuple(slice(a, b) for a, b in zip(mov_start, mov_stop))
@@ -103,7 +105,7 @@ def distributed_apply_transform(
             fix, mov, fix_spacing, mov_spacing,
             transform_list=transform_list,
             transform_spacing=transform_spacing,
-            transform_origin=fix_origin,
+            transform_origin=transform_origin,
             fix_origin=fix_origin,
             mov_origin=mov_origin,
         )
@@ -125,6 +127,7 @@ def distributed_apply_transform(
 
         # return result
         return aligned
+    # END: closure
 
     # align all blocks
     aligned = da.map_blocks(

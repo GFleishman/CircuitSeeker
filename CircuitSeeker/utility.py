@@ -52,7 +52,7 @@ def change_affine_matrix_origin(matrix, origin):
 
     tl, tr = np.eye(4), np.eye(4)
     origin = np.array(origin)
-    tl[:3, -1], tr[:3, -1] = origin, -origin
+    tl[:3, -1], tr[:3, -1] = -origin, origin
     return np.matmul(tl, np.matmul(matrix, tr))
 
 
@@ -119,7 +119,7 @@ def physical_parameters_to_affine_matrix(params, center):
     # rotation
     x = np.eye(4)
     x[:3, :3] = Rotation.from_rotvec(params[3:6]).as_matrix()
-    x = change_affine_matrix_origin(x, center)
+    x = change_affine_matrix_origin(x, -center)
     aff = np.matmul(x, aff)
     # scale
     x = np.diag(tuple(params[6:9]) + (1,))

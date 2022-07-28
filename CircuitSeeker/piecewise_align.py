@@ -182,7 +182,17 @@ def distributed_piecewise_alignment_pipeline(
         start = np.maximum(0, start)
         stop = np.minimum(fix.shape, stop)
         coords = tuple(slice(x, y) for x, y in zip(start, stop))
-        indices.append((i, j, k, coords))
+
+        foreground = True
+        if fix_mask is not None:
+            ratio = np.array(fix_mask.shape) / fix.shape
+            start = np.round( ratio * start ).astype(int)
+            stop = np.round( ratio * stop ).astype(int)
+            fix_mask_coords = tuple(slice(a, b) for a, b in zip(start, stop))
+            if not np.any(fix_mask[fix_mask_coords]): foreground = False
+
+        if foreground:
+            indices.append((i, j, k, coords))
 
     # establish all keyword arguments
     random_kwargs = {**kwargs, **random_kwargs}
@@ -203,7 +213,7 @@ def distributed_piecewise_alignment_pipeline(
         # get fixed image block corners in physical units
         fix_block_coords = []
         for corner in list(product([0, 1], repeat=3)):
-            a = [x.stop if y else x.start for x, y in zip(fix_slices, corner)]
+            a = [x.stop-1 if y else x.start for x, y in zip(fix_slices, corner)]
             fix_block_coords.append(a)
         fix_block_coords = np.array(fix_block_coords)
         fix_block_coords_phys = fix_block_coords * fix_spacing
@@ -215,9 +225,9 @@ def distributed_piecewise_alignment_pipeline(
         for transform in static_transform_list[::-1]:
             if transform.shape == (4, 4):
                 mov_block_coords_phys = apply_transform_to_coordinates(
-                    mov_block_coords_phys, transform,
+                    mov_block_coords_phys, [transform,],
                 )
-                transform = ut.change_affine_matrix_origin(transform, -fix_block_coords_phys[0])
+                transform = ut.change_affine_matrix_origin(transform, fix_block_coords_phys[0])
             else:
                 ratio = np.array(transform.shape[:-1]) / fix_zarr.shape
                 start = np.round( ratio * fix_block_coords[0] ).astype(int)
@@ -227,7 +237,7 @@ def distributed_piecewise_alignment_pipeline(
                 spacing = ut.relative_spacing(transform, fix, fix_spacing)
                 origin = spacing * [s.start for s in transform_slices]
                 mov_block_coords_phys = apply_transform_to_coordinates(
-                    mov_block_coords_phys, transform, spacing, origin
+                    mov_block_coords_phys, [transform,], spacing, origin
                 )
             new_list.append(transform)
         static_transform_list = new_list[::-1]
@@ -337,20 +347,11 @@ def distributed_piecewise_alignment_pipeline(
         partitions = [indices[0:a+b],]
         partitions += [indices[b+i*a:b+(i+1)*a] for i in range(1, n_serial_partitions)]
 
-        # functions for getting neighbor indices
         neighbor_offsets = np.array(list(product([-1, 0, 1], repeat=3)))
-        def original_neighbor_indices(index):
-            lock_indices = index + neighbor_offsets
-            not_too_low = lock_indices.min(axis=1) >= 0
-            not_too_high = np.all(lock_indices < nblocks, axis=1)
-            lock_indices = lock_indices[not_too_low * not_too_high, :]
-            return np.ravel_multi_index(lock_indices.transpose(), nblocks)
-        def partition_neighbor_indices(indices, partition_number):
-            offset = int(np.sum([len(x) for x in partitions[:partition_number]]))
-            indices = original_neighbor_indices(indices) - offset
-            not_too_low = indices >= 0
-            not_too_high = indices < len(partitions[partition_number])
-            return indices[not_too_low * not_too_high]
+        def neighbor_indices(index, partition_indices):
+            lock_indices = {tuple(index + x) for x in neighbor_offsets}
+            intersection = lock_indices.intersection(partition_indices.keys())
+            return [partition_indices[x] for x in intersection]
 
         # submit partitions in series
         for iii, partition in enumerate(partitions):
@@ -364,6 +365,7 @@ def distributed_piecewise_alignment_pipeline(
 
             # write blocks as parallel as possible
             written = np.zeros(len(futures), dtype=bool)
+            partition_indices = dict( (b[:3], a) for a, b in enumerate(partition) )
             while not np.all(written):
                 writing_futures = []
                 locked = np.zeros(len(futures), dtype=bool)
@@ -371,7 +373,7 @@ def distributed_piecewise_alignment_pipeline(
                     jjj = future_keys.index(future.key)
                     if future.done() and not written[jjj] and not locked[jjj]:
                         f = cluster.client.submit(write_block, partition[jjj][3], future)
-                        locked[partition_neighbor_indices(partition[jjj][:3], iii)] = True
+                        locked[neighbor_indices(partition[jjj][:3], partition_indices)] = True
                         writing_futures.append(f)
                         written[jjj] = True
                 wait(writing_futures)
