@@ -127,13 +127,17 @@ def motion_correct(
         # set alignment defaults
         alignment_defaults = {
             'rigid':True,
+            'smooth_sigmas':(1.),
             'alignment_spacing':2.0,
             'metric':'MS',
-            'sampling':'random',
+            'sampling':'RANDOM',
             'sampling_percentage':0.1,
-            'optimizer':'RGD',
-            'iterations':50,
-            'max_step':2.0,
+            'optimizer':'RSGD',
+            'optimizer_args':{
+                'learningRate':0.2,
+                'minStep':0.2,
+                'numberOfIterations':50,
+            },
         }
         for k, v in alignment_defaults.items():
             if k not in kwargs:
@@ -389,21 +393,7 @@ def resample_frames(
         )
 
         # write in parallel as 4D array to zarr file
-        compressor = Blosc(
-            cname='zstd',
-            clevel=compression_level,
-            shuffle=Blosc.BITSHUFFLE,
-        )
-        aligned_disk = zarr.open(
-            write_path, 'w',
-            shape=frames_aligned.shape,
-            chunks=[1,] + list(frames_data.shape[1:]),
-            dtype=frames_aligned.dtype,
-            compressor=compressor
-        )
-        da.to_zarr(frames_aligned, aligned_disk)
-
-        # return reference to zarr store
-        return aligned_disk
+        da.to_zarr(frames_aligned, write_path)
+        return zarr.open(write_path, mode='r+')
 
 
