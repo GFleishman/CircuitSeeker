@@ -150,8 +150,6 @@ def configure_irm(
         'MMI':irm.SetMetricAsMattesMutualInformation,
         'MS':irm.SetMetricAsMeanSquares,
     }
-    if metric in ('MMI', 'JHMI') and 'numberOfHistogramBins' not in metric_args:
-        metric_args['numberOfHistogramBins'] = 32
     metric_switch[metric](**metric_args)
 
     # sampling switch
@@ -193,7 +191,7 @@ def configure_irm(
             level = irm.GetCurrentLevel()
             iteration = irm.GetOptimizerIteration()
             metric = irm.GetMetricValue()
-            print("LEVEL: ", level, " ITERATION: ", iteration, " METRIC: ", metric)
+            print("LEVEL: ", level, " ITERATION: ", iteration, " METRIC: ", metric, flush=True)
     irm.AddCommand(sitk.sitkIterationEvent, lambda: callback(irm))
 
     # return configured irm

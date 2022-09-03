@@ -32,7 +32,7 @@ def distributed_apply_transform(
 
     # ensure all deforms are zarr
     new_list = []
-    zarr_blocks = (128,)*3 + (3,)  # TODO: generalize
+    zarr_blocks = (128,)*3 + (3,)
     for iii, transform in enumerate(transform_list):
         if transform.shape != (4, 4):
             zarr_path = temporary_directory.name + f'/deform{iii}.zarr'
@@ -67,7 +67,7 @@ def distributed_apply_transform(
         # read relevant region of transforms
         new_list = []
         transform_spacing = [fix_spacing,] * len(transform_list)
-        transform_origin = fix_origin
+        transform_origin = [fix_origin,] * len(transform_list)
         shape = fix_zarr.shape if not inverse_transforms else mov_zarr.shape
         for iii, transform in enumerate(transform_list):
             if transform.shape != (4, 4):
@@ -77,10 +77,11 @@ def distributed_apply_transform(
                 deform_slices = tuple(slice(a, b) for a, b in zip(start, stop))
                 transform = transform[deform_slices]
                 transform_spacing[iii] = fix_spacing / ratio
-                transform_origin = start * transform_spacing[iii]
+                transform_origin[iii] = start * transform_spacing[iii]
             new_list.append(transform)
         transform_list = new_list
         transform_spacing = tuple(transform_spacing)
+        transform_origin = tuple(transform_origin)
 
         # transform fixed block corners, read moving data
         fix_block_coords = []
@@ -161,6 +162,8 @@ def distributed_apply_transform_to_coordinates(
 ):
     """
     """
+
+    # TODO: check this for multiple deforms and transform_origin as a list
 
     # ensure temporary directory exists
     temporary_directory = temporary_directory or os.getcwd()

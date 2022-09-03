@@ -149,9 +149,8 @@ def distributed_piecewise_alignment_pipeline(
     """
 
     # temporary file paths and create zarr images
-    temporary_directory = temporary_directory or os.getcwd()
     temporary_directory = tempfile.TemporaryDirectory(
-        prefix='.', dir=temporary_directory,
+        prefix='.', dir=temporary_directory or os.getcwd(),
     )
     fix_zarr_path = temporary_directory.name + '/fix.zarr'
     mov_zarr_path = temporary_directory.name + '/mov.zarr'
@@ -231,11 +230,11 @@ def distributed_piecewise_alignment_pipeline(
             else:
                 ratio = np.array(transform.shape[:-1]) / fix_zarr.shape
                 start = np.round( ratio * fix_block_coords[0] ).astype(int)
-                stop = np.round( ratio * fix_block_coords[-1] ).astype(int)
+                stop = np.round( ratio * (fix_block_coords[-1] + 1) ).astype(int)
                 transform_slices = tuple(slice(a, b) for a, b in zip(start, stop))
                 transform = transform[transform_slices]
                 spacing = ut.relative_spacing(transform, fix, fix_spacing)
-                origin = spacing * [s.start for s in transform_slices]
+                origin = spacing * start
                 mov_block_coords_phys = apply_transform_to_coordinates(
                     mov_block_coords_phys, [transform,], spacing, origin
                 )
@@ -256,7 +255,7 @@ def distributed_piecewise_alignment_pipeline(
         if os.path.isdir(fix_mask_zarr_path):
             ratio = np.array(fix_mask_zarr.shape) / fix_zarr.shape
             start = np.round( ratio * fix_block_coords[0] ).astype(int)
-            stop = np.round( ratio * fix_block_coords[-1] ).astype(int)
+            stop = np.round( ratio * (fix_block_coords[-1] + 1) ).astype(int)
             fix_mask_slices = tuple(slice(a, b) for a, b in zip(start, stop))
             fix_mask = fix_mask_zarr[fix_mask_slices]
         if os.path.isdir(mov_mask_zarr_path):

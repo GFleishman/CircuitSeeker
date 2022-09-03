@@ -6,6 +6,9 @@ from CircuitSeeker.configure_irm import configure_irm
 from CircuitSeeker.transform import apply_transform
 from CircuitSeeker.metrics import patch_mutual_information
 
+# TODO: bug! fix_spacing is overwritten after resolve_sampling is called
+#       but downstream functions rely on it having the original value
+
 
 def resolve_sampling(
     fix,
@@ -241,6 +244,8 @@ def random_affine_search(
             spacing = ut.relative_spacing(transform, fix, fix_spacing)
         static_transform_spacing.append(spacing)
     static_transform_origin = [fix_origin,]*len(static_transform_list)
+    static_transform_spacing = tuple(static_transform_spacing)
+    static_transform_origin = tuple(static_transform_origin)
 
     # a useful value later, storing prevents redundant function calls
     WORST_POSSIBLE_SCORE = np.finfo(np.float64).max
@@ -426,6 +431,17 @@ def affine_align(
     if initial_transform_given and np.all(default == np.eye(fix.ndim + 1)):
         default = initial_condition
 
+    # specify static transform data explicitly
+    static_transform_spacing = []
+    for transform in static_transform_list:
+        spacing = fix_spacing
+        if transform.shape != (4, 4) and len(transform.shape) != 1:
+            spacing = ut.relative_spacing(transform, fix, fix_spacing)
+        static_transform_spacing.append(spacing)
+    static_transform_origin = [fix_origin,]*len(static_transform_list)
+    static_transform_spacing = tuple(static_transform_spacing)
+    static_transform_origin = tuple(static_transform_origin)
+
     # skip sample and convert inputs to sitk images
     X = resolve_sampling(
         fix, mov,
@@ -440,15 +456,6 @@ def affine_align(
     mov_spacing = X[5]
     fix_mask_spacing = X[6]
     mov_mask_spacing = X[7]
-
-    # specify static transform data explicitly
-    static_transform_spacing = []
-    for transform in static_transform_list:
-        spacing = fix_spacing
-        if transform.shape != (4, 4) and len(transform.shape) != 1:
-            spacing = ut.relative_spacing(transform, fix, fix_spacing)
-        static_transform_spacing.append(spacing)
-    static_transform_origin = [fix_origin,]*len(static_transform_list)
 
     # set up registration object
     irm = configure_irm(**kwargs)
@@ -607,6 +614,18 @@ def deformable_align(
 
     # store initial fixed image shape
     initial_fix_shape = fix.shape
+    initial_fix_spacing = fix_spacing
+
+    # specify static transform data explicitly
+    static_transform_spacing = []
+    for transform in static_transform_list:
+        spacing = fix_spacing
+        if transform.shape != (4, 4) and len(transform.shape) != 1:
+            spacing = ut.relative_spacing(transform, fix, fix_spacing)
+        static_transform_spacing.append(spacing)
+    static_transform_origin = [fix_origin,]*len(static_transform_list)
+    static_transform_spacing = tuple(static_transform_spacing)
+    static_transform_origin = tuple(static_transform_origin)
 
     # skip sample and convert inputs to sitk images
     X = resolve_sampling(
@@ -622,15 +641,6 @@ def deformable_align(
     mov_spacing = X[5]
     fix_mask_spacing = X[6]
     mov_mask_spacing = X[7]
-
-    # specify static transform data explicitly
-    static_transform_spacing = []
-    for transform in static_transform_list:
-        spacing = fix_spacing
-        if transform.shape != (4, 4) and len(transform.shape) != 1:
-            spacing = ut.relative_spacing(transform, fix, fix_spacing)
-        static_transform_spacing.append(spacing)
-    static_transform_origin = [fix_origin,]*len(static_transform_list)
 
     # set up registration object
     irm = configure_irm(**kwargs)
@@ -660,7 +670,7 @@ def deformable_align(
         params = np.concatenate((transform.GetFixedParameters(), transform.GetParameters()))
         field = ut.bspline_to_displacement_field(
             transform, initial_fix_shape,
-            spacing=fix_spacing, origin=fix_origin,
+            spacing=initial_fix_spacing, origin=fix_origin,
             direction=np.eye(3),
         )
         default = (params, field)
@@ -681,10 +691,10 @@ def deformable_align(
         params = np.concatenate((transform.GetFixedParameters(), transform.GetParameters()))
         field = ut.bspline_to_displacement_field(
             transform, initial_fix_shape,
-            spacing=fix_spacing, origin=fix_origin,
+            spacing=initial_fix_spacing, origin=fix_origin,
             direction=np.eye(3),
         )
-        sys.stdout.flush()
+        print("Registration succeeded", flush=True)
         return params, field
     else:
         print("Optimization failed to improve metric")

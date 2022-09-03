@@ -17,6 +17,66 @@ def apply_transform(
     extrapolate_with_nn=False,
 ):
     """
+    Resample moving image onto fixed image through a list
+    of transforms.
+
+    Parameters
+    ----------
+    fix : ndarray
+        the fixed image
+
+    mov : ndarray
+        the moving image; `fix.ndim` must equal `mov.ndim`
+
+    fix_spacing : 1d array
+        The spacing in physical units (e.g. mm or um) between voxels
+        of the fixed image. Length must equal `fix.ndim`.
+
+    mov_spacing : 1d array
+        The spacing in physical units (e.g. mm or um) between voxels
+        of the moving image. Length must equal `mov.ndim`.
+
+    transform_list : list
+        The list of transforms to apply. These may be 2d arrays of shape 4x4
+        (affine transforms), or ndarrays of `fix.ndim` + 1 dimension (deformations).
+        Zarr arrays work just fine.
+
+    transform_spacing : None (default), 1d array, or tuple of 1d arrays
+        The spacing in physical units (e.g. mm or um) between voxels
+        of any deformations in transform_list. If None, all deforms
+        are assumed to have fix_spacing. If a single 1d array all
+        deforms have that spacing. If a tuple, then it's length must
+        be the same as transform_list, thus each deformation can be
+        given its own spacing. Spacings given for affine transforms
+        are ignored.
+
+    transform_origin : None (default), 1d array, or tuple of 1d arrays
+        The origin in physical units (e.g. mm or um) of the given transforms.
+        If None, all origins are assumed to be (0, 0, 0, ...); otherwise, follows
+        the same logic as transform_spacing.
+
+    fix_origin : None (defaut) or 1darray
+        The origin in physical units (e.g. mm or um) of the fixed image. If None
+        the origin is assumed to be (0, 0, 0, ...)
+
+    mov_origin : None (default) or 1darray
+        The origin in physical units (e.g. mm or um) of the moving image. If None
+        the origin is assumed to be (0, 0, 0, ...)
+
+    interpolate_with_nn : Bool (default: False)
+        If true interpolations are done with Nearest Neighbors. Use if warping
+        segmentation/multi-label data.
+
+    extrapolate_with_nn : Bool (default: False)
+        If true extrapolations are done with Nearest Neighbors. Use if warping
+        segmentation/multi-label data. Also prevents edge effects from padding
+        when warping image data.
+
+    Returns
+    -------
+    warped image : ndarray
+        The moving image warped through transform_list and resampled onto the
+        fixed image grid.
     """
 
     # set global number of threads
@@ -64,6 +124,35 @@ def apply_transform_to_coordinates(
     transform_origin=None,
 ):
     """
+    Move a set of coordinates through a list of transforms
+
+    Parameters
+    ----------
+    coordinates : Nxd array
+        The coordinates to move. N such coordinates in d dimensions.
+
+    transform_list : list
+        The transforms to apply, in stack order. Elements must be 2d 4x4 arrays
+        (affine transforms) or d + 1 dimension ndarrays (deformations).
+
+    transform_spacing : None (default), 1d array, or tuple of 1d arrays
+        The spacing in physical units (e.g. mm or um) between voxels
+        of any deformations in transform_list. If any transform_list
+        contains any deformations then transform_spacing cannot be
+        None. If a single 1d array then all deforms have that spacing.
+        If a tuple, then its length must be the same as transform_list,
+        thus each deformation can be given its own spacing. Spacings
+        given for affine transforms are ignored.
+
+    transform_origin : None (default), 1d array, or tuple of 1d arrays
+        The origin in physical units (e.g. mm or um) of the given transforms.
+        If None, all origins are assumed to be (0, 0, 0, ...); otherwise, follows
+        the same logic as transform_spacing.
+
+    Returns
+    -------
+    transform_coordinates : Nxd array
+        The given coordinates transformed by the given transform_list
     """
 
     # transform list should be a stack, last added is first applied
@@ -84,19 +173,21 @@ def apply_transform_to_coordinates(
             error_message += "transform_spacing must be given."
             assert (transform_spacing is not None), error_message
 
-            # handle multiple spacings
+            # handle multiple spacings and origins
             spacing = transform_spacing
+            origin = transform_origin
             if isinstance(spacing, tuple): spacing = spacing[iii]
+            if isinstance(origin, tuple): origin = origin[iii]
 
             # get coordinates in transform voxel units, reformat for map_coordinates
-            if transform_origin is not None: coordinates -= transform_origin
+            if origin is not None: coordinates -= origin
             coordinates = ( coordinates / spacing ).transpose()
     
             # interpolate position field at coordinates, reformat, return
             interp = lambda x: map_coordinates(x, coordinates, order=1, mode='nearest')
             dX = np.array([interp(transform[..., i]) for i in range(3)]).transpose()
             coordinates = coordinates.transpose() * spacing + dX
-            if transform_origin is not None: coordinates += transform_origin
+            if origin is not None: coordinates += origin
 
     return coordinates
 
