@@ -244,6 +244,16 @@ def compose_transforms(transform_one, transform_two, spacing):
     )
 
 
+def compose_transform_list(transforms, spacing):
+    """
+    """
+
+    transform = transforms.pop()
+    while transforms:
+        transform = compose_transforms(transforms.pop(), transform, spacing)
+    return transform
+
+
 def invert_displacement_vector_field(
     field,
     spacing,

@@ -3,7 +3,7 @@ import numpy as np
 import SimpleITK as sitk
 import CircuitSeeker.utility as ut
 from CircuitSeeker.configure_irm import configure_irm
-from CircuitSeeker.transform import apply_transform
+from CircuitSeeker.transform import apply_transform, compose_transform_list
 from CircuitSeeker.metrics import patch_mutual_information
 
 # TODO: bug! fix_spacing is overwritten after resolve_sampling is called
@@ -714,14 +714,11 @@ def alignment_pipeline(
     fix_origin=None,
     mov_origin=None,
     static_transform_list=[],
-    random_kwargs={},
-    rigid_kwargs={},
-    affine_kwargs={},
-    deform_kwargs={},
+    return_format='flatten',
     **kwargs,
 ):
     """
-    Compose random, rigid, affine, and deformable alignment with one function call
+    Compose random, rigid, affine, and deformable alignments with one function call
 
     Parameters
     ----------
@@ -740,13 +737,15 @@ def alignment_pipeline(
         The spacing in physical units (e.g. mm or um) between voxels
         of the moving image.
 
-    steps : list of strings
-        Alignment steps to run. Options include:
+    steps : list of tuples in this form [(str, dict), (str, dict), ...]
+        For each tuple, the str specifies which alignment to run. The options are:
         'random' : run `random_affine_search`
         'rigid' : run `affine_align` with `rigid=True`
         'affine' : run `affine_align`
         'deform' : run `deformable_align`
-        Steps can only be run in this order. Omissions are ok, e.g. ['random', 'affine']
+        For each tuple, the dict specifies the arguments to that alignment function
+        Arguments specified here override any global arguments given through kwargs
+        for their specific step only.
 
     fix_mask : binary ndarray (default: None)
         A mask limiting metric evaluation region of the fixed image
@@ -774,23 +773,19 @@ def alignment_pipeline(
         can be different. I.e. the origin and span are the same (in phyiscal
         units) but the number of voxels can be different.
 
-    random_kwargs : dict (default: None)
-        Arguments passed to `random_affine_search`
-
-    rigid_kwargs : dict (default: None)
-        Arguments passed to `affine_align` when `rigid=True` (rigid alignment)
-
-    affine_kwargs : dict (default: None)
-        Arguments passed to `affine_align` when `rigid=False` (affine alignment)
-
-    deform_kwargs : dict (default: None)
-        Arguments passed to `deformable_align`
+    return_format : str (default: 'flatten')
+        The way in which transforms are returned to the user. Options are:
+        'independent' : one transform per step is returned, no compositions
+        'compressed' : adjacent affines and adjacent deforms are composed,
+                       but affines are not composed with deforms. For example:
+                       ['random', 'affine', 'deform', 'deform', 'affine', 'deform']
+                       will return a list of 4 transforms.
+        'flatten' : compose all transforms regardless of type into a single transform
 
     **kwargs : any additional keyword arguments
         Global arguments that apply to all alignment steps
         These are overwritten by specific arguments passed via
-        `random_kwargs`, `rigid_kwargs`, `affine_kwargs`, and
-        `deform_kwargs`
+        the dictionaries in steps
 
     Returns
     -------
@@ -806,74 +801,32 @@ def alignment_pipeline(
         vector field with shape equal to fix.shape + (3,)
     """
 
-    # establish all keyword arguments
-    random_kwargs = {**kwargs, **random_kwargs}
-    rigid_kwargs = {**kwargs, **rigid_kwargs}
-    affine_kwargs = {**kwargs, **affine_kwargs}
-    deform_kwargs = {**kwargs, **deform_kwargs}
+    # define how to run alignment functions
+    a = (fix, mov, fix_spacing, mov_spacing)
+    b = {'fix_mask':fix_mask, 'mov_mask':mov_mask,
+         'fix_origin':fix_origin, 'mov_origin':mov_origin,}
+    align = {'random':lambda **c: random_affine_search(*a, **b, **c)[0],
+             'rigid': lambda **c: affine_align(*a, **b, **c, rigid=True),
+             'affine':lambda **c: affine_align(*a, **b, **c),
+             'deform':lambda **c: deformable_align(*a, **b, **c)[1],}
 
-    # let default be identity
-    affine = np.eye(fix.ndim + 1)
+    # loop over steps
+    initial_transform_count = len(static_transform_list)
+    for alignment, arguments in steps:
+        arguments = {**kwargs, **arguments}
+        arguments['static_transform_list'] = static_transform_list
+        static_transform_list.append(align[alignment](**arguments))
 
-    # random initialization
-    if 'random' in steps:
-        affine = random_affine_search(
-            fix, mov,
-            fix_spacing, mov_spacing,
-            fix_mask=fix_mask,
-            mov_mask=mov_mask,
-            fix_origin=fix_origin,
-            mov_origin=mov_origin,
-            static_transform_list=static_transform_list,
-            **random_kwargs,
-         )[0]
-    # rigid alignment
-    if 'rigid' in steps:
-        if 'random' in steps:
-            static_transform_list += [affine,]
-        affine = affine_align(
-            fix, mov,
-            fix_spacing, mov_spacing,
-            rigid=True,
-            fix_mask=fix_mask,
-            mov_mask=mov_mask,
-            fix_origin=fix_origin,
-            mov_origin=mov_origin,
-            static_transform_list=static_transform_list,
-            **rigid_kwargs,
-        )
-        if 'random' in steps:
-            affine = np.matmul(static_transform_list.pop(-1), affine)
-    # affine alignment
-    if 'affine' in steps:
-        affine = affine_align(
-            fix, mov,
-            fix_spacing, mov_spacing,
-            initial_condition=affine,
-            fix_mask=fix_mask,
-            mov_mask=mov_mask,
-            fix_origin=fix_origin,
-            mov_origin=mov_origin,
-            static_transform_list=static_transform_list,
-            **affine_kwargs,
-        )
-    # deformable align
-    if 'deform' in steps:
-        static_transform_list += [affine,]
-        deform = deformable_align(
-            fix, mov,
-            fix_spacing, mov_spacing,
-            fix_mask=fix_mask,
-            mov_mask=mov_mask,
-            fix_origin=fix_origin,
-            mov_origin=mov_origin,
-            static_transform_list=static_transform_list,
-            **deform_kwargs,
-        )[1]
-        return affine, deform
-
-    # return affine result
-    else:
-        return affine
-
+    # return in the requested format
+    new_transforms = static_transform_list[initial_transform_count:]
+    if return_format == 'independent':
+        return new_transforms
+    elif return_format == 'compressed':
+        shapes = np.array([x.shape for x in new_transforms], dtype=object)
+        changes = np.where(shapes[:-1] != shapes[1:])[0] + 1
+        changes = [0,] + list(changes) + [len(new_transforms),]
+        F = lambda a, b: compose_transform_list(new_transforms[a:b], fix_spacing)
+        return [F(a, b) for a, b in zip(changes[:-1], changes[1:])]
+    elif return_format == 'flatten':
+        return compose_transform_list(new_transforms, fix_spacing)
 

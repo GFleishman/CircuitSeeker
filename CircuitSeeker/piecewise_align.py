@@ -1,6 +1,7 @@
 import os, tempfile
 import numpy as np
 from itertools import product
+from scipy.interpolate import LinearNDInterpolator
 from dask.distributed import as_completed, wait
 from ClusterWrap.decorator import cluster
 import CircuitSeeker.utility as ut
@@ -17,15 +18,11 @@ def distributed_piecewise_alignment_pipeline(
     fix_spacing,
     mov_spacing,
     steps,
-    nblocks,
+    blocksize,
     overlap=0.5,
     fix_mask=None,
     mov_mask=None,
     static_transform_list=[],
-    random_kwargs={},
-    rigid_kwargs={},
-    affine_kwargs={},
-    deform_kwargs={},
     cluster=None,
     cluster_kwargs={},
     temporary_directory=None,
@@ -63,12 +60,18 @@ def distributed_piecewise_alignment_pipeline(
         of the moving image.
         Length must equal `mov.ndim`
 
-    steps : list of strings
-        steps argument of alignment_pipeline function
+    steps : list of tuples in this form [(str, dict), (str, dict), ...]
+        For each tuple, the str specifies which alignment to run. The options are:
+        'random' : run `random_affine_search`
+        'rigid' : run `affine_align` with `rigid=True`
+        'affine' : run `affine_align`
+        'deform' : run `deformable_align`
+        For each tuple, the dict specifies the arguments to that alignment function
+        Arguments specified here override any global arguments given through kwargs
+        for their specific step only.
 
-    nblocks : iterable
-        The number of blocks to use along each axis.
-        Length should be equal to `fix.ndim`
+    blocksize : iterable
+        The shape of blocks in voxels
 
     overlap : float in range [0, 1] (default: 0.5)
         Block overlap size as a percentage of block size
@@ -90,22 +93,6 @@ def distributed_piecewise_alignment_pipeline(
         Assumed to have the same domain as the fixed image, though sampling
         can be different. I.e. the origin and span are the same (in physical
         units) but the number of voxels can be different.
-
-    random_kwargs : dict (default: {})
-        Arguments passed to `random_affine_search`
-        Note - some arguments are required. See documentation for `random_affine_search`
-
-    rigid_kwargs : dict (default: {})
-        Arguments passed to `affine_align` during rigid step
-        Note - some arguments are required. See documentation for `affine_align`
-
-    affine_kwargs : dict (default: {})
-        Arguments passed to `affine_align` during affine step
-        Note - some arguments are required. See documentation for `affine_align`
-
-    deform_kwargs : dict (default: {})
-        Arguments passed to `deformable_align`
-        Note - some arguments are required. See documentation for `deformable_align`
 
     cluster : ClusterWrap.cluster object (default: None)
         Only set if you have constructed your own static cluster. The default behavior
@@ -162,7 +149,7 @@ def distributed_piecewise_alignment_pipeline(
     if fix_mask is not None: fix_mask_zarr = ut.numpy_to_zarr(fix_mask, zarr_blocks, fix_mask_zarr_path)
     if mov_mask is not None: mov_mask_zarr = ut.numpy_to_zarr(mov_mask, zarr_blocks, mov_mask_zarr_path)
 
-    # zarr files for initial deformations, get initial deform spacings
+    # zarr files for initial deformations
     new_list = []
     for iii, transform in enumerate(static_transform_list):
         if transform.shape != (4, 4) and len(transform.shape) != 1:
@@ -172,9 +159,10 @@ def distributed_piecewise_alignment_pipeline(
     static_transform_list = new_list
 
     # determine fixed image slices for blocking
-    blocksize = np.ceil( np.array(fix.shape) / nblocks ).astype(int)
+    blocksize = np.array(blocksize)
+    nblocks = np.ceil(np.array(fix.shape) / blocksize).astype(int)
     overlaps = np.round(blocksize * overlap).astype(int)
-    indices = []
+    indices, slices = [], []
     for (i, j, k) in np.ndindex(*nblocks):
         start = blocksize * (i, j, k) - overlaps
         stop = start + blocksize + 2 * overlaps
@@ -184,6 +172,8 @@ def distributed_piecewise_alignment_pipeline(
 
         foreground = True
         if fix_mask is not None:
+            start = blocksize * (i, j, k)
+            stop = start + blocksize
             ratio = np.array(fix_mask.shape) / fix.shape
             start = np.round( ratio * start ).astype(int)
             stop = np.round( ratio * stop ).astype(int)
@@ -191,13 +181,19 @@ def distributed_piecewise_alignment_pipeline(
             if not np.any(fix_mask[fix_mask_coords]): foreground = False
 
         if foreground:
-            indices.append((i, j, k, coords))
+            indices.append((i, j, k,))
+            slices.append(coords)
+
+    # determine foreground neighbor structure
+    new_indices = []
+    neighbor_offsets = np.array(list(product([-1, 0, 1], repeat=3)))
+    for index, coords in zip(indices, slices):
+        neighbor_flags = {tuple(o): tuple(index + o) in indices for o in neighbor_offsets}
+        new_indices.append((index, coords, neighbor_flags))
+    indices = new_indices
 
     # establish all keyword arguments
-    random_kwargs = {**kwargs, **random_kwargs}
-    rigid_kwargs = {**kwargs, **rigid_kwargs}
-    affine_kwargs = {**kwargs, **affine_kwargs}
-    deform_kwargs = {**kwargs, **deform_kwargs}
+    steps = [(a, {**kwargs, **b}) for a, b in steps]
 
     # closure for alignment pipeline
     def align_single_block(
@@ -206,7 +202,7 @@ def distributed_piecewise_alignment_pipeline(
     ):
 
         # get the coordinates, read fixed data
-        block_index, fix_slices = indices[:3], indices[3]
+        block_index, fix_slices, neighbor_flags = indices
         fix = fix_zarr[fix_slices]
 
         # get fixed image block corners in physical units
@@ -243,10 +239,10 @@ def distributed_piecewise_alignment_pipeline(
 
         # get moving image crop, read moving data 
         mov_block_coords = np.round(mov_block_coords_phys / mov_spacing).astype(int)
-        mov_block_coords = np.maximum(0, mov_block_coords)
-        mov_block_coords = np.minimum(np.array(mov_zarr.shape)-1, mov_block_coords)
         mov_start = np.min(mov_block_coords, axis=0)
         mov_stop = np.max(mov_block_coords, axis=0)
+        mov_start = np.maximum(0, mov_start)
+        mov_stop = np.minimum(np.array(mov_zarr.shape)-1, mov_stop)
         mov_slices = tuple(slice(a, b) for a, b in zip(mov_start, mov_stop))
         mov = mov_zarr[mov_slices]
 
@@ -274,36 +270,45 @@ def distributed_piecewise_alignment_pipeline(
             fix_mask=fix_mask, mov_mask=mov_mask,
             mov_origin=mov_origin,
             static_transform_list=static_transform_list,
-            random_kwargs=random_kwargs,
-            rigid_kwargs=rigid_kwargs,
-            affine_kwargs=affine_kwargs,
-            deform_kwargs=deform_kwargs,
         )
 
-        # convert to single vector field
-        if isinstance(transform, tuple):
-            affine, deform = transform[0], transform[1]
-            transform = compose_transforms(affine, deform, fix_spacing)
-        else:
-            transform = ut.matrix_to_displacement_field(transform, fix.shape, fix_spacing)
+        # TODO: this weight procedure is still somehow inaccurate
+        #       overlap regions of edge blocks go to zero (should be 1 everywhere)
+        #       a separate but smaller issue might be numerical precision
+        #       i.e. taking ratios of small numbers is not a great idea
+        # create the standard weight array
+        core = tuple(x - 2*y + 2 for x, y in zip(blocksize, overlaps))
+        pad = tuple((2*y - 1, 2*y - 1) for y in overlaps)
+        weights = np.pad(np.ones(core, dtype=np.float32), pad, mode='linear_ramp')
 
-        # create weights array
-        core, pad_ones, pad_linear = [], [], []
+        # rebalance if any neighbors are missing
+        if not np.all(list(neighbor_flags.values())):
+
+            # define overlap slices
+            slices = {}
+            slices[-1] = tuple(slice(0, 2*y) for y in overlaps)
+            slices[0] = tuple(slice(y, -y) for y in overlaps)
+            slices[1] = tuple(slice(-2*y, None) for y in overlaps)
+
+            missing_weights = np.zeros_like(weights)
+            for neighbor, flag in neighbor_flags.items():
+                if not flag:
+                    neighbor_region = tuple(slices[-1*b][a] for a, b in enumerate(neighbor))
+                    region = tuple(slices[b][a] for a, b in enumerate(neighbor))
+                    missing_weights[region] += weights[neighbor_region]
+
+            # rebalance the weights
+            weights = weights / (1 - missing_weights)
+
+        # crop weights if block is on edge of domain
         for i in range(3):
-            # get core shape and pad sizes
-            o = max(0, 2*overlaps[i]-1)
-            p_ones, p_linear = [0, 0], [o, o]
+            region = [slice(None),]*3
             if block_index[i] == 0:
-                p_ones[0], p_linear[0] = o//2, 0
+                region[i] = slice(overlaps[i], None)
+                weights = weights[region]
             if block_index[i] == nblocks[i] - 1:
-                p_ones[1], p_linear[1] = o//2, 0
-            core.append( blocksize[i] - o + 1 )
-            pad_ones.append(tuple(p_ones))
-            pad_linear.append(tuple(p_linear))
-        # create weights
-        weights = np.ones(core, dtype=np.float32)
-        weights = np.pad(weights, pad_ones, mode='constant', constant_values=1)
-        weights = np.pad(weights, pad_linear, mode='linear_ramp', end_values=0)
+                region[i] = slice(None, -overlaps[i])
+                weights = weights[region]
 
         # crop any incomplete blocks (on the ends)
         if np.any( weights.shape != transform.shape[:-1] ):
@@ -329,7 +334,7 @@ def distributed_piecewise_alignment_pipeline(
         for batch in as_completed(futures, with_results=True).batches():
             for future, result in batch:
                 iii = future_keys.index(future.key)
-                transform[indices[iii][3]] += result
+                transform[indices[iii][1]] += result
 
     # for large alignments
     else:
@@ -346,7 +351,6 @@ def distributed_piecewise_alignment_pipeline(
         partitions = [indices[0:a+b],]
         partitions += [indices[b+i*a:b+(i+1)*a] for i in range(1, n_serial_partitions)]
 
-        neighbor_offsets = np.array(list(product([-1, 0, 1], repeat=3)))
         def neighbor_indices(index, partition_indices):
             lock_indices = {tuple(index + x) for x in neighbor_offsets}
             intersection = lock_indices.intersection(partition_indices.keys())
@@ -364,15 +368,15 @@ def distributed_piecewise_alignment_pipeline(
 
             # write blocks as parallel as possible
             written = np.zeros(len(futures), dtype=bool)
-            partition_indices = dict( (b[:3], a) for a, b in enumerate(partition) )
+            partition_indices = dict( (b[0], a) for a, b in enumerate(partition) )
             while not np.all(written):
                 writing_futures = []
                 locked = np.zeros(len(futures), dtype=bool)
                 for future in futures:
                     jjj = future_keys.index(future.key)
                     if future.done() and not written[jjj] and not locked[jjj]:
-                        f = cluster.client.submit(write_block, partition[jjj][3], future)
-                        locked[neighbor_indices(partition[jjj][:3], partition_indices)] = True
+                        f = cluster.client.submit(write_block, partition[jjj][1], future)
+                        locked[neighbor_indices(partition[jjj][0], partition_indices)] = True
                         writing_futures.append(f)
                         written[jjj] = True
                 wait(writing_futures)
