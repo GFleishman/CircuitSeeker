@@ -27,7 +27,6 @@ def distributed_piecewise_alignment_pipeline(
     cluster_kwargs={},
     temporary_directory=None,
     write_path=None,
-    n_serial_partitions=1,
     **kwargs,
 ):
     """
@@ -117,12 +116,6 @@ def distributed_piecewise_alignment_pipeline(
         process memory, set this parameter to a location where the transform
         can be written to disk as a zarr file.
 
-    n_serial_partitions : int (default: 1)
-        The number of sets of parallel computations to run. Very large alignments
-        can overwhelm the resources of even a large cluster. This can be solved
-        by ordering the computations in a way that fits into the requested
-        resources. 
-
     kwargs : any additional arguments
         Arguments that will apply to all alignment steps. These are overruled by
         arguments for specific steps e.g. `random_kwargs` etc.
@@ -157,6 +150,15 @@ def distributed_piecewise_alignment_pipeline(
             transform = ut.numpy_to_zarr(transform, zarr_blocks + (transform.shape[-1],), path)
         new_list.append(transform)
     static_transform_list = new_list
+
+    # zarr file for output (if write_path is given)
+    if write_path:
+        output_transform = ut.create_zarr(
+            write_path,
+            fix.shape + (fix.ndim,),
+            zarr_blocks + (fix.ndim,),
+            np.float32,
+        )
 
     # determine fixed image slices for blocking
     blocksize = np.array(blocksize)
@@ -200,6 +202,9 @@ def distributed_piecewise_alignment_pipeline(
         indices,
         static_transform_list,
     ):
+
+        # print some feedback
+        print("Block index: ", indices[0], "\nSlices: ", indices[1], flush=True)
 
         # get the coordinates, read fixed data
         block_index, fix_slices, neighbor_flags = indices
@@ -272,14 +277,10 @@ def distributed_piecewise_alignment_pipeline(
             static_transform_list=static_transform_list,
         )
 
-        # TODO: this weight procedure is still somehow inaccurate
-        #       overlap regions of edge blocks go to zero (should be 1 everywhere)
-        #       a separate but smaller issue might be numerical precision
-        #       i.e. taking ratios of small numbers is not a great idea
         # create the standard weight array
         core = tuple(x - 2*y + 2 for x, y in zip(blocksize, overlaps))
         pad = tuple((2*y - 1, 2*y - 1) for y in overlaps)
-        weights = np.pad(np.ones(core, dtype=np.float32), pad, mode='linear_ramp')
+        weights = np.pad(np.ones(core, dtype=np.float64), pad, mode='linear_ramp')
 
         # rebalance if any neighbors are missing
         if not np.all(list(neighbor_flags.values())):
@@ -287,7 +288,7 @@ def distributed_piecewise_alignment_pipeline(
             # define overlap slices
             slices = {}
             slices[-1] = tuple(slice(0, 2*y) for y in overlaps)
-            slices[0] = tuple(slice(y, -y) for y in overlaps)
+            slices[0] = (slice(None),) * len(overlaps)
             slices[1] = tuple(slice(-2*y, None) for y in overlaps)
 
             missing_weights = np.zeros_like(weights)
@@ -299,6 +300,8 @@ def distributed_piecewise_alignment_pipeline(
 
             # rebalance the weights
             weights = weights / (1 - missing_weights)
+            weights[np.isnan(weights)] = 0.  # edges of blocks are 0/0
+            weights = weights.astype(np.float32)
 
         # crop weights if block is on edge of domain
         for i in range(3):
@@ -315,8 +318,15 @@ def distributed_piecewise_alignment_pipeline(
             crop = tuple(slice(0, s) for s in transform.shape[:-1])
             weights = weights[crop]
 
-        # return the weighted transform
-        return transform * weights[..., None]
+        # apply weights
+        transform = transform * weights[..., None]
+
+        # return or write the data
+        if not write_path:
+            return transform
+        else:
+            output_transform[fix_slices] = output_transform[fix_slices] + transform
+            return True
     # END CLOSURE
 
     # for small alignments
@@ -335,53 +345,54 @@ def distributed_piecewise_alignment_pipeline(
             for future, result in batch:
                 iii = future_keys.index(future.key)
                 transform[indices[iii][1]] += result
+        return transform
 
     # for large alignments
     else:
 
-        # initialize container and define how to write to it
-        shape = fix.shape + (fix.ndim,)
-        transform = ut.create_zarr(write_path, shape, zarr_blocks + (fix.ndim,), np.float32)
-        def write_block(coords, block):
-            transform[coords] = transform[coords] + block
+        # get zarr blocks touched by every alignment block
+        def get_zarr_blocks(coords):
+            ranges = [(a.start//b, (a.stop-1)//b+1) for a, b in zip(coords, zarr_blocks)]
+            return set(product(*[range(a[0], a[1]) for a in ranges]))
+        write_blocks = [get_zarr_blocks(index[1]) for index in indices]
 
-        # split into serial partitions
-        a = len(indices) // n_serial_partitions
-        b = len(indices) % n_serial_partitions
-        partitions = [indices[0:a+b],]
-        partitions += [indices[b+i*a:b+(i+1)*a] for i in range(1, n_serial_partitions)]
+        # a function for locking out conflicting writes
+        def get_locks(running):
+            locked_blocks = set().union(*[write_blocks[x] for x in range(len(running)) if running[x]])
+            return [not locked_blocks.isdisjoint(x) for x in write_blocks]
 
-        def neighbor_indices(index, partition_indices):
-            lock_indices = {tuple(index + x) for x in neighbor_offsets}
-            intersection = lock_indices.intersection(partition_indices.keys())
-            return [partition_indices[x] for x in intersection]
+        # a function for submitting all non-running and non-locked blocks
+        def submit_new_blocks(indices, written, running, locked):
+            futures = []
+            future_indices = {}
+            for iii, index in enumerate(indices):
+                if not written[iii] and not running[iii] and not locked[iii]:
+                    f = cluster.client.submit(
+                        align_single_block, index,
+                        static_transform_list=static_transform_list,
+                    )
+                    futures.append(f)
+                    future_indices[f.key] = iii
+                    running[iii] = True
+                    locked = get_locks(running)
+            return futures, future_indices
 
-        # submit partitions in series
-        for iii, partition in enumerate(partitions):
+        # submit blocks as parallel as possible
+        written = [False,] * len(indices)
+        running = [False,] * len(indices)
+        locked = [False,] * len(indices)
+        futures, future_indices = submit_new_blocks(indices, written, running, locked)
+        complete_futures = as_completed(futures)
+        for future in complete_futures:  # TODO: experiment with batches
+            iii = future_indices[future.key]
+            written[iii] = True
+            running[iii] = False
+            locked = get_locks(running)
+            new_futures, new_future_indices = submit_new_blocks(indices, written, running, locked)
+            complete_futures.update(new_futures)
+            future_indices = {**future_indices, **new_future_indices}
 
-            # submit partition to cluster
-            futures = cluster.client.map(
-                align_single_block, partition,
-                static_transform_list=static_transform_list,
-            )
-            future_keys = [f.key for f in futures]
-
-            # write blocks as parallel as possible
-            written = np.zeros(len(futures), dtype=bool)
-            partition_indices = dict( (b[0], a) for a, b in enumerate(partition) )
-            while not np.all(written):
-                writing_futures = []
-                locked = np.zeros(len(futures), dtype=bool)
-                for future in futures:
-                    jjj = future_keys.index(future.key)
-                    if future.done() and not written[jjj] and not locked[jjj]:
-                        f = cluster.client.submit(write_block, partition[jjj][1], future)
-                        locked[neighbor_indices(partition[jjj][0], partition_indices)] = True
-                        writing_futures.append(f)
-                        written[jjj] = True
-                wait(writing_futures)
-
-    return transform
+        return output_transform
 
 
 # TODO: this function not yet refactored

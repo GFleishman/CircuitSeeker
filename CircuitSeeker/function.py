@@ -2,6 +2,8 @@ import numpy as np
 import zarr
 from ClusterWrap.decorator import cluster
 import dask.array as da
+from scipy.ndimage import find_objects
+from dask.distributed import as_completed
 
 
 def deltafoverf(
@@ -71,4 +73,62 @@ def distributed_deltafoverf(
     dff = dff.persist()
     da.to_zarr(dff, write_path)
     return zarr.open(write_path, mode='r+')
+
+
+def apply_cell_mask(
+    masks,
+    data,
+    max_label=0,
+):
+    """
+    """
+
+    boxes = find_objects(masks, max_label=max_label)
+    result = np.empty((len(boxes), + data.shape[0]), dtype=data.dtype)
+    result.fill(np.nan)
+    for iii, box in enumerate(boxes):
+        if box:
+            mask = masks[box] == iii + 1
+            masked_crop = data[ (slice(None),) + box ]
+            result[iii] = np.mean(masked_crop, axis=(1, 2, 3), where=mask)
+    return result
+
+
+@cluster
+def distributed_apply_cell_mask(
+    masks,
+    zarr_array,
+    batch_size,
+    max_label=0,
+    cluster=None,
+    cluster_kwargs={},
+):
+    """
+    """
+
+    # construct dask versions of inputs
+    masks_d = cluster.client.scatter(masks, broadcast=True)
+    start_indices = list(range(0, zarr_array.shape[0], batch_size))
+
+    # wrap function
+    def wrapped_apply_cell_mask(index, masks_d):
+        data = zarr_array[index:index+batch_size]
+        return apply_cell_mask(masks_d, data, max_label=max_label)
+
+    # submit all blocks
+    futures = cluster.client.map(
+        wrapped_apply_cell_mask, start_indices,
+        masks_d=masks_d
+    )
+    future_keys = [f.key for f in futures]
+
+    # collect results and store in array
+    nrows = max_label if max_label else masks.max()
+    results = np.empty((nrows, zarr_array.shape[0]), dtype=zarr_array.dtype)
+    for batch in as_completed(futures, with_results=True).batches():
+        for future, result in batch:
+            iii = future_keys.index(future.key)
+            results[:, iii*batch_size:(iii+1)*batch_size] = result
+
+    return results
 
