@@ -109,6 +109,7 @@ def blockwise_cell_quality_score(
     spacing,
     bounds,
     radius,
+    second_image=None,
     mask=None,
     **kwargs,
 ):
@@ -126,7 +127,10 @@ def blockwise_cell_quality_score(
 
     # pad the array to prevent edge effects in averaging
     image = np.pad(image, pad, mode='constant')
-    mask = np.pad(mask, pad, mode='constant')
+    if second_image is not None:
+        second_image = np.pad(second_image, pad, mode='constant')
+    if mask is not None:
+        mask = np.pad(mask, pad, mode='constant')
 
     # get valid sample point coordinates
     samples = np.zeros(image.shape, dtype=bool)
@@ -142,7 +146,16 @@ def blockwise_cell_quality_score(
     for iii, coordinate in enumerate(zip(samples[0], samples[1], samples[2])):
         if iii % 100 == 0: print("{} percent complete".format(iii/len(samples[0])))
         context = tuple(slice(x-r, x+r+1) for x, r in zip(coordinate, stride))
-        score = cell_quality_score(image[context], spacing, bounds, **kwargs)
+        if second_image is not None:
+            score = bounded_fourier_shell_correlation(
+                image[context],
+                second_image[context],
+                spacing,
+                spacing,
+                bounds,
+            )
+        else:
+            score = cell_quality_score(image[context], spacing, bounds, **kwargs)
         scores[context] += score * weights
 
     # return result

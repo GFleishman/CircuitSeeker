@@ -22,6 +22,7 @@ def distributed_piecewise_alignment_pipeline(
     overlap=0.5,
     fix_mask=None,
     mov_mask=None,
+    foreground_percentage=0.5,
     static_transform_list=[],
     cluster=None,
     cluster_kwargs={},
@@ -179,8 +180,9 @@ def distributed_piecewise_alignment_pipeline(
             ratio = np.array(fix_mask.shape) / fix.shape
             start = np.round( ratio * start ).astype(int)
             stop = np.round( ratio * stop ).astype(int)
-            fix_mask_coords = tuple(slice(a, b) for a, b in zip(start, stop))
-            if not np.any(fix_mask[fix_mask_coords]): foreground = False
+            mask_crop = fix_mask[tuple(slice(a, b) for a, b in zip(start, stop))]
+            if not np.sum(mask_crop) / np.prod(mask_crop.shape) >= foreground_percentage:
+                foreground = False
 
         if foreground:
             indices.append((i, j, k,))
@@ -276,6 +278,12 @@ def distributed_piecewise_alignment_pipeline(
             mov_origin=mov_origin,
             static_transform_list=static_transform_list,
         )
+
+        # ensure transform is a vector field
+        if transform.shape == (4, 4):
+            transform = ut.matrix_to_displacement_field(
+                transform, fix.shape, spacing=fix_spacing,
+            )
 
         # create the standard weight array
         core = tuple(x - 2*y + 2 for x, y in zip(blocksize, overlaps))
@@ -389,6 +397,7 @@ def distributed_piecewise_alignment_pipeline(
             running[iii] = False
             locked = get_locks(running)
             new_futures, new_future_indices = submit_new_blocks(indices, written, running, locked)
+            # TODO: print feedback on number of blocks submited, finished, out of total
             complete_futures.update(new_futures)
             future_indices = {**future_indices, **new_future_indices}
 

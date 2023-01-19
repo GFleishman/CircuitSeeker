@@ -147,7 +147,8 @@ def apply_transform_to_coordinates(
     transform_origin : None (default), 1d array, or tuple of 1d arrays
         The origin in physical units (e.g. mm or um) of the given transforms.
         If None, all origins are assumed to be (0, 0, 0, ...); otherwise, follows
-        the same logic as transform_spacing.
+        the same logic as transform_spacing. Origins given for affine transforms
+        are ignored.
 
     Returns
     -------

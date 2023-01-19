@@ -14,7 +14,7 @@ def distributed_apply_transform(
     fix_spacing, mov_spacing,
     transform_list,
     blocksize,
-    write_path,
+    write_path=None,
     overlap=0.5,
     inverse_transforms=False,
     dataset_path=None,
@@ -26,7 +26,7 @@ def distributed_apply_transform(
     """
     """
 
-    # temporary file paths and create zarr images
+    # temporary file paths and ensure inputs are zarr
     temporary_directory = tempfile.TemporaryDirectory(
         prefix='.', dir=temporary_directory or os.getcwd(),
     )
@@ -54,7 +54,7 @@ def distributed_apply_transform(
 
     # get overlap and number of blocks
     blocksize = np.array(blocksize)
-    overlap = np.round(blocksize * overlap).astype(int)  # NOTE: overlap too big?
+    overlap = np.round(blocksize * overlap).astype(int)  # NOTE: default overlap too big?
     nblocks = np.ceil(np.array(fix_zarr.shape) / blocksize).astype(int)
 
     # store block coordinates in a dask array
@@ -64,9 +64,7 @@ def distributed_apply_transform(
         stop = start + blocksize + 2 * overlap
         start = np.maximum(0, start)
         stop = np.minimum(fix_zarr.shape, stop)
-        coords = tuple(slice(x, y) for x, y in zip(start, stop))
-        block_coords[i, j, k] = coords
-    store = block_coords
+        block_coords[i, j, k] = tuple(slice(x, y) for x, y in zip(start, stop))
     block_coords = da.from_array(block_coords, chunks=(1,)*block_coords.ndim)
 
     # pipeline to run on each block
@@ -86,8 +84,7 @@ def distributed_apply_transform(
                 start = np.floor(fix_origin / kwargs['transform_spacing'][iii]).astype(int)
                 stop = [s.stop for s in fix_slices] * fix_spacing / kwargs['transform_spacing'][iii]
                 stop = np.ceil(stop).astype(int)
-                transform_slices = tuple(slice(a, b) for a, b in zip(start, stop))
-                transform = transform[transform_slices]
+                transform = transform[tuple(slice(a, b) for a, b in zip(start, stop))]
                 transform_origin[iii] = start * kwargs['transform_spacing'][iii]
             new_list.append(transform)
         transform_list = new_list
@@ -150,13 +147,14 @@ def distributed_apply_transform(
     )
 
     # crop to original size
-    aligned = aligned[tuple(slice(0, s) for s in fix_zarr.shape)]
+    aligned = aligned[tuple(slice(s) for s in fix_zarr.shape)]
 
-    # compute result, write to zarr array
-    da.to_zarr(aligned, write_path, component=dataset_path)
-
-    # return reference to result
-    return zarr.open(write_path, 'r+')
+    # return
+    if write_path:
+        da.to_zarr(aligned, write_path, component=dataset_path)
+        return zarr.open(write_path, 'r+')
+    else:
+        return aligned.compute()
 
 
 @cluster
