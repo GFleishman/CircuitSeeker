@@ -200,17 +200,14 @@ def motion_correct(
     # set alignment defaults
     alignment_defaults = {
         'rigid':True,
-        'smooth_sigmas':(2.,),
         'alignment_spacing':2.0,
+        'shrink_factors':(2,),
+        'smooth_sigmas':(2.,),
         'metric':'MS',
-        'sampling':'REGULAR',
-        'sampling_percentage':0.5,
-        'optimizer':'GD',
         'optimizer_args':{
-            'learningRate':1.0,  # ignored
-            'numberOfIterations':500,
-            'estimateLearningRate':2,
-            'maximumStepSizeInPhysicalUnits':fix_spacing.min() / 4,
+            'learningRate':0.25,
+            'minStep':0.,
+            'numberOfIterations':400,
         },
     }
     kwargs = {**alignment_defaults, **kwargs}
@@ -218,11 +215,17 @@ def motion_correct(
     # wrap align function
     def wrapped_affine_align(mov, fix_d, fix_mask_d):
         mov = mov.squeeze()
+#        t = affine_align(
+#            fix_d, mov, fix_spacing, frames_spacing,
+#            fix_mask=fix_mask_d,
+#            **kwargs,
+#        )
         t = affine_align(
-            fix_d, mov, fix_spacing, frames_spacing,
-            fix_mask=fix_mask_d,
+            mov, fix_d, frames_spacing, fix_spacing,
+            mov_mask=fix_mask_d,
             **kwargs,
         )
+        t = np.linalg.inv(t)
         # TODO: 2 lines below assume its a rigid transform
         e = ut.matrix_to_euler_transform(t)
         p = ut.euler_transform_to_parameters(e)
