@@ -1,5 +1,6 @@
 import numpy as np
 import zarr
+from numcodecs import Blosc
 from ClusterWrap.decorator import cluster
 import dask.array as da
 from scipy.ndimage import find_objects
@@ -11,15 +12,31 @@ def deltafoverf(
     window_size,
 ):
     """
+    Computes change in activity level as a percentage of baseline for time series
+    data. E.g. the Delta F over F for calcium imaging data.
+
+    Parameters
+    ----------
+    array : ndarray
+        The time series data. Time should be the first axis.
+
+    window_size : int
+        The number of frames used to compute the rolling average baseline
+
+    Returns
+    -------
+    dff : ndarray
+        Only frames with a complete baseline are returned, so the shape is
+        window_size fewer frames than the input.
     """
 
     # create container to store result
     new_shape = (array.shape[0] - window_size,) + array.shape[1:]
-    dff = np.empty(new_shape, dtype=np.float32)  # TODO: user specifies precision
+    dff = np.empty(new_shape, dtype=np.float32)
 
-    # get window start and stop indices and sum image
-    w_start, w_stop = 0, window_size
-    sum_image = np.sum(array[w_start:w_stop], axis=0)
+    # initialize window start index and the sum image
+    w_start = 0
+    sum_image = np.sum(array[w_start:window_size], axis=0, dtype=np.float32)
 
     # loop over frames
     for iii in range(window_size, array.shape[0]):
@@ -43,6 +60,42 @@ def distributed_deltafoverf(
     cluster_kwargs={},
 ):
     """
+    Calls deltafoverf on chunks of a larger-than-memory time series in parallel
+    on distributed hardware.
+
+    Parameters
+    ----------
+    zarr_array : zarr.Array
+        The time series data. Time should be the first axis.
+
+    window_size : int
+        The number of frames used to compute the rolling average baseline
+
+    batch_size : int
+        The number of frames that make up each chunk of the time series data
+        to work on in parallel.
+
+    write_path : string
+        The path where the computed delta f over f zarr file should be written
+
+    compression_level : int in range [0, 9] (default: 4)
+        The amount the final output is compressed. Lower numbers will write faster
+        but take up more space. Be warned, large compression_level can result
+        in very long compression/write times.
+
+    cluster : ClusterWrap.cluster object (default: None)
+        Only set if you have constructed your own static cluster. The default behavior
+        is to construct a cluster for the duration of this function, the close it
+        when the function is finished.
+
+    cluster_kwargs : dict (default: {})
+        Arguments passed to ClusterWrap.cluster
+        If working with an LSF cluster, this will be ClusterWrap.janelia_lsf_cluster.
+        If on a workstation this will be ClusterWrap.local_cluster.
+        This is how distribution parameters are specified.
+
+    Returns
+    -------
     """
 
     # create dask array of start indices
@@ -50,29 +103,29 @@ def distributed_deltafoverf(
     while start_index + window_size < zarr_array.shape[0]:
         start_indices.append(start_index)
         start_index = start_index + batch_size - window_size
-    start_indices_da = da.from_array(start_indices, chunks=(1,))
+
+    # create output zarr
+    compressor = Blosc(cname='zstd', clevel=4, shuffle=Blosc.BITSHUFFLE)
+    output_zarr = zarr.open(
+        write_path, 'w',
+        shape=(zarr_array.shape[0] - window_size,) + zarr_array.shape[1:],
+        chunks=(1,) + zarr_array.shape[1:],
+        dtype=np.float32,
+        compressor=compressor,
+    )
 
     # wrap deltafoverf function
     def wrapped_deltafoverf(index):
-        data = zarr_array[index[0]:index[0]+batch_size]
-        return deltafoverf(data, window_size)
+        read_slice = slice(index, index+batch_size)
+        write_slice = slice(index, index+batch_size-window_size)
+        output_zarr[write_slice] = deltafoverf(zarr_array[read_slice], window_size)
+        return True
 
-    # map function to each block
-    dff = da.map_blocks(
-        wrapped_deltafoverf, start_indices_da,
-        dtype=np.float32,
-        new_axis=list(range(1, zarr_array.ndim)),
-        chunks=(batch_size-window_size,) + zarr_array.chunks[1:],
-    )
-
-    # ensure the correct shape and rechunk for faster writing
-    dff = dff[:zarr_array.shape[0] - window_size]
-    dff = dff.rechunk((1,) + zarr_array.chunks[1:])
-
-    # persist on cluster, write to zarr, return reference
-    dff = dff.persist()
-    da.to_zarr(dff, write_path)
-    return zarr.open(write_path, mode='r+')
+    # submit all
+    futures = cluster.client.map(wrapped_deltafoverf, start_indices)
+    all_written = np.all(cluster.client.gather(futures))
+    if not all_written: print('SOMETHING FAILED, CHECK LOGS')
+    return output_zarr
 
 
 def apply_cell_mask(
