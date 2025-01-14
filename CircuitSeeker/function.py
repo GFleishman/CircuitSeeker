@@ -137,13 +137,13 @@ def apply_cell_mask(
     """
 
     boxes = find_objects(masks, max_label=max_label)
-    result = np.empty((len(boxes), + data.shape[0]), dtype=data.dtype)
+    result = np.empty((len(boxes), + data.shape[0]), dtype=np.float32)
     result.fill(np.nan)
     for iii, box in enumerate(boxes):
         if box:
             mask = masks[box] == iii + 1
-            masked_crop = data[ (slice(None),) + box ]
-            result[iii] = np.mean(masked_crop, axis=(1, 2, 3), where=mask)
+            data_crop = data[ (slice(None),) + box ]
+            result[iii] = np.mean(data_crop, axis=(1, 2, 3), where=mask)
     return result
 
 
@@ -177,7 +177,7 @@ def distributed_apply_cell_mask(
 
     # collect results and store in array
     nrows = max_label if max_label else masks.max()
-    results = np.empty((nrows, zarr_array.shape[0]), dtype=zarr_array.dtype)
+    results = np.empty((nrows, zarr_array.shape[0]), dtype=np.float32)
     for batch in as_completed(futures, with_results=True).batches():
         for future, result in batch:
             iii = future_keys.index(future.key)

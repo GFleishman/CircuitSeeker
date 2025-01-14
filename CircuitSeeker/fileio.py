@@ -4,6 +4,8 @@ from glob import glob
 from os import path
 import numpy as np
 import ClusterWrap
+from ClusterWrap.decorator import cluster
+import zarr
 
 import dask.bag as db
 import dask.array as da
@@ -202,3 +204,49 @@ def distributed_stack_to_hdf5(
     with ClusterWrap.cluster(**cluster_kwargs) as cluster:
         stack_paths_b.map(stack_to_hdf5, write_paths_b, dims, dtype).compute()
 
+
+@cluster
+def rechunk_zarr(
+    zarr_array,
+    new_chunksize,
+    write_path,
+    chunk_groups,
+    cluster=None,
+    cluster_kwargs={},
+):
+    """
+    """
+
+    # create the new zarr
+    new_zarr_array = zarr.open(
+        write_path, 'w',
+        shape=zarr_array.shape,
+        chunks=new_chunksize,
+        dtype=zarr_array.dtype,
+        synchronizer=zarr.ThreadSynchronizer(),
+    )
+
+    # determine the block coordinates
+    blocksize = np.array(new_chunksize) * chunk_groups
+    nblocks = np.ceil(np.array(zarr_array.shape) / blocksize).astype(int)
+    slices = []
+    for index in np.ndindex(*nblocks):
+        start = blocksize * index
+        stop = start + blocksize
+        stop = np.minimum(zarr_array.shape, stop)
+        slices.append(tuple(slice(x, y) for x, y in zip(start, stop)))
+
+    # define what to do for each write group; read carefully to not overwhelm memory
+    def write_new_blocks(coords):
+        shape = tuple(x.stop - x.start for x in coords)
+        data = np.empty(shape, dtype=zarr_array.dtype)
+        for iii in range(coords[0].start, coords[0].stop):
+            data[iii - coords[0].start] = zarr_array[iii][coords[1:]]
+        new_zarr_array[coords] = data
+        return True
+
+    # submit all blocks
+    futures = cluster.client.map(write_new_blocks, slices)
+    all_written = np.all( cluster.client.gather(futures) )
+    return new_zarr_array
+        
